@@ -1,0 +1,2 @@
+#!/bin/bash
+exec sudo /usr/bin/lxc-attach -n "$1" --clear-env -- /bin/login -f root
