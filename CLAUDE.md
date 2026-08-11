@@ -7,10 +7,12 @@ systemd-native, root SSH). Production will be `lxc0`, `lxc1`, ... (FQDN
 `lxc0.dev.lan` / `lxc0.prod.lan`) on C4D/N4D + Hyperdisk Balanced, hosting
 ~28 MQTT broker CTs (consolidating existing 28-VM fleet), MariaDB, OMS CTs.
 
-Working dir: `/opt/cttools` (staging). Deploy targets:
-- `ct-create`, `ct-destroy` -> `/usr/local/sbin/`
-- `defaults.conf`, `mqtt.conf`, `ctN.service.template` -> `/etc/ct-create/`
-- hook scripts -> `/etc/ct-create/scripts/`
+Working dir: `/opt/cttools` (git repo, github.com/tacticallinux/cttools).
+Single deliverable: the `ct` script. Deploy = `ct init` (self-installs to
+/usr/local/sbin/ct, writes embedded payloads to /etc/ct/ + ct@.service +
+bash completion; idempotent, only-if-missing unless --force). Hook scripts
+are NOT embedded - `ct hooks pull` fetches them from the repo-scripts GH
+repo into /etc/ct/scripts/.
 
 ## Architecture (all validated working on t2d1)
 
@@ -21,7 +23,9 @@ Working dir: `/opt/cttools` (staging). Deploy targets:
 - t2d1 nic0 `ens4` (10.128.0.33) has alias `containers:10.130.0.0/28`
 - CT networking: `lxc.net.0.type = ipvlan`, `ipvlan.mode = l3s`, `link = ens4`.
   ZERO host-side per-CT network config (no veth, no bridges, no networkd files)
-- Addressing rule: **ctN = 10.130.0.N** (ct1=.1 ... ct15=.15; /28 cap; .1 is
+- Addressing rule: **ctN = CT_IP_BASE + N** (per-host slice; t2d1:
+  base 10.130.0.0 /28 -> ct1=.1..ct15=.15; prod hosts get /27 slices
+  (CT_SLICE_SIZE=32, ct1..ct31), e.g. lxc1 base .32 -> ct1=.33. .base+1 is
   usable - no gateway IP exists in ipvlan L3)
 - In-CT eth0.network: Address=10.130.0.N/32, DNS=169.254.169.254, default
   route `Destination=0.0.0.0/0 Scope=link` (device route, no gateway), MTU
@@ -66,11 +70,18 @@ Working dir: `/opt/cttools` (staging). Deploy targets:
   unit Restart=always RestartSec=2. Reason: lxc-start -F internal reboot
   breaks idmapped rootfs mount (perms show nobody/nogroup). In-CT `reboot` =
   clean stop -> systemd restarts fresh. Host-side restart always safe
-- Units: `/etc/systemd/system/ctN.service` (convention: ctN.service, NOT
-  lxc-ctN), one file per CT sed-generated from template. Delegate=yes,
-  MemoryMax/MemoryHigh (hard cap/soft throttle), CPUQuota (hard ceiling, per
-  one core), optional CPUWeight (proportional share under contention).
-  Template units (ct@.service) considered and rejected
+- Units: ONE template `/etc/systemd/system/ct@.service`, instance = CT number
+  (`systemctl start ct@2` runs ct2; journal: `journalctl -u ct@2`). Per-CT
+  resource overrides live in `/etc/systemd/system/ct@N.service.d/
+  50-resources.conf` drop-ins written by `ct create`/`ct set` - only
+  non-default knobs appear there; default-resource CTs have no drop-in.
+  Template fixes: Delegate=yes, Restart=always/RestartSec=2 (reboot handling),
+  OOMPolicy=continue (in-CT OOM kill must not stop the whole CT),
+  MemorySwapMax=0. Knob set (all ceilings/priorities, NOT reservations):
+  MemoryMax/High/Low/Min, CPUQuota (from decimal cores)/CPUWeight/AllowedCPUs,
+  IO*BandwidthMax + IO*IOPSMax (per-device, auto-filled), TasksMax=2048.
+  Per-CT metadata: /var/lib/lxc/ctN/ct.conf (bash KEY=VALUE; replaces the old
+  alias stamp; source of truth for list/info/set/destroy)
 
 ### SSH console access (no sshd in CTs)
 - `ssh ctN@t2d1` -> root shell in ctN. Mechanism:
@@ -96,56 +107,83 @@ Working dir: `/opt/cttools` (staging). Deploy targets:
   gcloud --configuration=$CT_GCLOUD_CONFIG, warn-don't-die on failure)
 - Instance alias (--alias / CT_ALIAS): CNAME `<alias>.<domain>` -> CT FQDN,
   e.g. mqtt3.dev.lan -> ct2.t2d1.dev.lan. Also: /etc/hosts line, PS1 via
-  /etc/profile.d/ct-alias.sh (root@ct2[mqtt3]:...), stamp file
-  /var/lib/lxc/ctN/alias. ct-destroy removes CNAME (keeps A), rm stamp
+  /etc/profile.d/ct-alias.sh (root@ct2[mqtt3]:...), recorded in ct.conf.
+  `ct destroy` removes CNAME (keeps A); `ct set --alias` re-points it
 - Config-vs-alias semantics: --config = role/profile (packages etc., e.g.
   mqtt.conf), --alias = instance name (mqtt3)
+- gcloud auth: VM service account via metadata server (no key file, no guest
+  agent needed; SA needs DNS perms in CT_DNS_PROJECT). Optional
+  CT_GCLOUD_KEY_FILE for SA-key auth. Both zones live in the dev project, so
+  prod hosts write DNS cross-project (grant their SA dns perms in dev)
 
-## Scripts (in /opt/cttools)
+## The `ct` tool (single script, /opt/cttools/ct)
 
-### ct-create [--name ctN] [--config <name>] [--alias <alias>] [--dry-run|-n]
-Auto-picks lowest free N (by /var/lib/lxc/ctN existence), IP=10.130.0.N.
-Config layering: built-in defaults -> /etc/ct-create/defaults.conf ->
-/etc/ct-create/<name>.conf (--config) -> CLI --alias wins over CT_ALIAS.
-Validates: root, btrfs, >=10% free, name/unit conflict, hooks executable,
-template exists. Auto-extends subuid/subgid. (Step-by-step flow: read the
-deployed script.)
-Hooks: arrays, entries "script.sh [args...]", relative to
-CT_HOOK_SCRIPTS_DIR=/etc/ct-create/scripts (host), run inside CT with args
-(eval-parsed, quoted args ok). Template-based creates SKIP fresh-build steps
-(templates pre-baked).
-
-### ct-destroy ctN --yes [--force] [--purge] [--dry-run|-n]
-Refuses if running w/o --force. Disables unit, deletes CNAME via alias stamp,
-btrfs subvolume delete (or rm -rf legacy), removes config+alias. --purge also
-removes unit file + host user. Default keeps unit/user for reuse.
-
-### Config files (see /etc/ct-create/ for current contents)
+Subcommand CLI, bash, shellcheck-clean, `ct help <cmd>` for details:
+- create/destroy/attach/exec/list/info/start/stop/restart/set - container ops.
+  create auto-picks lowest free N; IP = CT_IP_BASE + N; config layering:
+  built-in -> /etc/ct/defaults.conf -> /etc/ct/<role>.conf (--config) -> CLI
+  flags (CLI resource flags win over role configs). destroy: --yes required,
+  --force to stop running, --purge removes drop-in + ssh user, --keep-dns
+- set: rewrites the resource drop-in + ct.conf; --live applies cgroup knobs
+  to the running CT via set-property (IO knobs need restart)
+- init: idempotent host bootstrap (packages, masks, sysctls, subuid, sshd
+  Match, sudoers, nftables scaffold, payload deploy, self-install). --check
+  = report only, --force = overwrite payload files
+- gcp-init: project side (secondary range, alias slice claim w/ conflict
+  check, private DNS zone, NAT coverage report). --check = report only
+- doctor: read-only health report, exit 0/1/2 = ok/warn/fail
+- hooks list|pull: hook scripts from CT_HOOKS_REPO_URL (repo-scripts GH repo;
+  _*-prefixed files skipped). Hooks in configs: bash arrays, entries
+  "script.sh [args...]" relative to /etc/ct/scripts, eval-parsed
+- completion: emits bash completion (init installs to /etc/bash_completion.d)
+- Resource flags: --mem-max/--mem-high/--mem-protect/--mem-reserve (bytes),
+  --cpu-max (decimal cores -> CPUQuota), --cpu-weight, --cpu-pin,
+  --io-{read,write}-{max,iops} (per-device, auto-detected), --tasks-max.
+  Help text shows host-derived ranges and ceiling-not-reservation language
 - Default packages: systemd,systemd-sysv,systemd-timesyncd,iputils-ping,nano,
   net-tools,less,lrzsz,rsync,procps,wget,curl,locales,tzdata,iproute2,
   bash-completion (+ systemd-resolved post-installed in chroot - debootstrap
   --include of resolved FAILS in chroot, known issue, hence two-step)
+- Template-based creates SKIP fresh-build steps (templates pre-baked)
 
-## Host setup already done on t2d1 (replicate on prod hosts)
+## Host setup (now automated: `ct init` + `ct gcp-init`; verify: `ct doctor`)
+All of the below is what init does/checks - on a new host: curl the ct script,
+`ct init`, `ct gcp-init`, mount btrfs at /var/lib/lxc, add pubkey to
+/etc/ssh/ct_authorized_keys, done:
 - ip_forward=1, rp_filter=2; lxc installed --no-install-recommends; lxc-net
   disabled+masked; /etc/systemd/system-generators/systemd-ssh-generator
   masked (vsock error noise on GCE, systemd 256+)
-- nftables.conf persisted + service enabled (currently: inet nat prerouting
-  DNAT 35.225.59.53 -> 10.130.0.2)
-- subuid/subgid root:231072:1048576; ssh users; sudoers; sshd Match block
+- nftables.conf persisted + service enabled (t2d1 pre-existing conf kept:
+  inet nat prerouting DNAT 35.225.59.53 -> 10.130.0.2; init leaves existing
+  nftables.conf alone, writes a scaffold only when absent)
+- subuid/subgid root:231072:1048576; ctadmin group/user; sudoers; sshd Match
+  block (init writes to /etc/ssh/sshd_config.d/50-ct.conf on fresh hosts;
+  t2d1 still carries it in the main sshd_config - equivalent)
 - btrfs disk mounted /var/lib/lxc (fstab; compress=zstd:1 noatime recommended)
-- gcloud installed, config 'dev', SA gce-sa@development-237419 w/
-  roles/monitoring.editor added
+  - init checks but cannot create this (disk attach is manual/gce-create)
+- gcloud installed; VM SA needs DNS write perms in CT_DNS_PROJECT (works on
+  t2d1 today via gce-sa@development-237419)
 
 ## Open items / next steps
-1. **ct-snap** script + systemd timer: btrfs subvolume snapshot -r into
-   /var/lib/lxc/.snapshots/<ct>-<stamp>, retention prune. Recovery: stop CT,
-   mv rootfs aside, rw-snapshot from snapshot, start. Cadence TBD
-2. **ct-template** script: snapshot existing CT rootfs -> .templates/<name>
-   (rw) -> offline sysprep (truncate machine-id, rm eth0.network/hosts line/
-   ct-alias.sh/logs/apt cache/history; KEEP bash_profile/reboot symlink/
-   enables) -> btrfs property set ro true. Templates independent of source CT
-   (CoW; source deletable). Never boot templates
+1. **ct snap** subcommand + systemd timer: btrfs subvolume snapshot -r into
+   CT_SNAP_DIR=/var/lib/lxc/.snapshots/<ct>-<stamp>, retention prune
+   (CT_SNAP_KEEP). Recovery: stop CT, mv rootfs aside, rw-snapshot from
+   snapshot, start. Cadence TBD. (config keys + completion already reserved)
+2. **ct template** subcommand: snapshot existing CT rootfs ->
+   CT_TEMPLATE_DIR=.templates/<name> (rw) -> offline sysprep (truncate
+   machine-id, rm eth0.network/hosts line/ct-alias.sh/logs/apt cache/history;
+   KEEP bash_profile/reboot symlink/enables) -> btrfs property set ro true.
+   Templates independent of source CT (CoW; source deletable). Never boot
+   templates. (`ct create --template <name>` already resolves names there)
+2b. **Log subvolume** (decided, not built): host subvol or per-CT for daemon
+   logs, bind-mounted into CTs, EXCLUDED from ct snap; keep CoW+zstd (files
+   die young via 3-day logrotate, fragmentation bounded); chown to CT's
+   mapped root uid (bind mounts are NOT idmap-shifted!). ~310 lines/s/node
+   unbatched fwrite = trivial IOPS; volume ~5GB/day/node raw is the sizing
+   driver
+2c. Consider masking sys-kernel-config.mount, sys-kernel-debug.mount,
+   systemd-modules-load.service inside CTs (fail harmlessly in userns ->
+   'degraded'; mask in template for clean 'running')
 3. Off-host backup: btrfs send/receive incremental + PD snapshots (DR layer)
 4. Security punch list (deferred): nftables egress allowlist per CT (input/
    output hooks!), lxc.cap.drop, seccomp verification, read-only rootfs,
@@ -163,7 +201,11 @@ removes unit file + host user. Default keeps unit/user for reuse.
    One daemon has known unfixed CPU issue + memory leak; source to be shared
    with Claude for fixing
 7. gce-create script exists (separate, from earlier sessions) for VM
-   provisioning; ct-create modeled on its defaults+named-config pattern
+   provisioning; ct's config layering modeled on its defaults+named-config
+   pattern
+8. **mqtt.conf hook list needs Diane's review**: CT_HOOKS_ATTACH runs
+   nginx-repo.sh + php-repo.sh --install - looks copy-pasted from a web
+   profile; an MQTT node likely wants mosquitto-repo.sh instead
 
 ## Conventions / gotchas learned
 - nftables: 'fwd' is a reserved keyword (chain name ctfwd); [0-9] globs work

@@ -1,0 +1,1784 @@
+#!/bin/bash
+# ct - LXC container host management tool (GCP/GCE-specific)
+#
+# Single portable script: manages unprivileged ipvlan-L3s LXC containers on a
+# btrfs-backed GCE host, self-deploys its own configs/unit/completion via
+# `ct init`, and prepares the GCP project side via `ct gcp-init`.
+#
+# Containers: ctN (N=1..CT_MAX), IP = CT_IP_BASE + N, unit = ct@N.service
+# Per-CT resource overrides: /etc/systemd/system/ct@N.service.d/50-resources.conf
+# Per-CT metadata:           /var/lib/lxc/ctN/ct.conf
+#
+# See `ct help` / `ct help <command>`.
+set -euo pipefail
+
+CT_VERSION="1.0.0"
+
+# ---------------------------------------------------------------------------
+# Built-in defaults (layer 1). Overridden by /etc/ct/defaults.conf (layer 2),
+# then /etc/ct/<role>.conf via --config (layer 3), then CLI flags (layer 4).
+# ---------------------------------------------------------------------------
+CONFDIR=/etc/ct
+
+CT_LXC_DIR=/var/lib/lxc
+CT_LINK_IF=ens4                 # host NIC the ipvlan CTs ride on
+CT_IP_BASE=10.130.0.0           # this host's slice base; CT IP = base + N
+CT_SLICE_SIZE=32                # IPs in this host's slice (32 -> /27, ct1..ct31)
+CT_IDMAP_START=231072
+CT_IDMAP_SIZE=65536
+CT_SSH_UID=1005
+CT_SSH_GID=1005
+
+CT_CODENAME=trixie
+CT_MIRROR=http://deb.debian.org/debian
+CT_PACKAGES=systemd,systemd-sysv,systemd-timesyncd,iputils-ping,nano,net-tools,less,lrzsz,rsync,procps,wget,curl,locales,tzdata,iproute2,bash-completion
+CT_TZ=America/Los_Angeles
+CT_TEMPLATE=                    # btrfs subvolume dir OR .tar/.tar.gz/.tar.zst; empty = debootstrap
+CT_TEMPLATE_DIR=/var/lib/lxc/.templates
+CT_SNAP_DIR=/var/lib/lxc/.snapshots
+# shellcheck disable=SC2034  # reserved for the upcoming `ct snap`
+CT_SNAP_KEEP=7
+
+# Resource knob defaults (see `ct help set` for semantics; empty = no limit)
+CT_MEM_MAX=512M
+CT_MEM_HIGH=448M
+CT_MEM_PROTECT=
+CT_MEM_RESERVE=
+CT_CPU_MAX=                     # decimal cores, e.g. 1.5
+CT_CPU_WEIGHT=100
+CT_CPU_PIN=
+CT_IO_READ_MAX=
+CT_IO_WRITE_MAX=
+CT_IO_READ_IOPS=
+CT_IO_WRITE_IOPS=
+CT_TASKS_MAX=2048
+
+# Hooks
+CT_HOOK_SCRIPTS_DIR=/etc/ct/scripts
+CT_HOOKS_CHROOT=()
+CT_HOOKS_ATTACH=()
+CT_HOOKS_REPO_URL=https://github.com/tacticallinux/repo-scripts.git
+CT_SCRIPTS_TARGET=/etc/ct/scripts   # path inside the CT
+
+# GCP / DNS  (CT_DNS_PROJECT empty = skip all DNS operations)
+CT_GCP_PROJECT=
+CT_DNS_PROJECT=
+# shellcheck disable=SC2100  # false positive: 'dev-lan' is a literal, not arithmetic
+CT_GCP_DNS_ZONE_NAME=dev-lan
+CT_DNS_DOMAIN=dev.lan
+CT_DNS_TTL=300
+CT_GCLOUD_KEY_FILE=             # empty = use the VM's service account (metadata server)
+
+CT_ALIAS=
+
+# Values baked into the ct@.service template payload; a per-CT drop-in is only
+# written for knobs whose effective value differs from these.
+TPL_MEM_MAX=512M
+TPL_MEM_HIGH=448M
+TPL_CPU_WEIGHT=100
+TPL_TASKS_MAX=2048
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+DRYRUN=0
+QUIET=0
+
+die()  { echo "ERROR: $*" >&2; exit 1; }
+warn() { echo "WARN: $*" >&2; }
+info() { [ "$QUIET" = 1 ] || echo ">>> $*"; }
+
+run() {  # execute or echo depending on dry-run
+  if [ "$DRYRUN" = 1 ]; then echo "DRY: $*"; else "$@"; fi
+}
+
+write_file() {  # write_file <path> <mode> ; content on stdin (dry-run aware)
+  local path=$1 mode=$2
+  if [ "$DRYRUN" = 1 ]; then
+    echo "DRY: write $path (mode $mode)"; cat >/dev/null
+  else
+    mkdir -p "$(dirname "$path")"
+    cat > "$path"
+    chmod "$mode" "$path"
+  fi
+}
+
+need_root() { [ "$(id -u)" = 0 ] || die "must run as root"; }
+
+load_defaults() {
+  # shellcheck disable=SC1091
+  [ -f "$CONFDIR/defaults.conf" ] && . "$CONFDIR/defaults.conf"
+  return 0
+}
+
+load_role() {  # $1 = role name
+  [ -f "$CONFDIR/$1.conf" ] || die "named config not found: $CONFDIR/$1.conf"
+  # shellcheck disable=SC1090
+  . "$CONFDIR/$1.conf"
+}
+
+# --- host facts -------------------------------------------------------------
+host_cores()  { nproc; }
+host_mem_kb() { awk '/^MemTotal:/{print $2}' /proc/meminfo; }
+host_mem_h()  { awk '/^MemTotal:/{printf "%.1fG", $2/1048576}' /proc/meminfo; }
+lxc_backing_dev() {  # device backing CT_LXC_DIR (for per-device IO limits)
+  findmnt -n -o SOURCE --target "$CT_LXC_DIR" 2>/dev/null | sed 's/\[.*\]//'
+}
+
+# --- naming / addressing ----------------------------------------------------
+ct_max() { echo $((CT_SLICE_SIZE - 1)); }
+
+norm_ct() {  # accept "ct7" or "7" -> echoes "ct7"; validates range
+  local a=$1 n
+  case "$a" in
+    ct[0-9]*) n=${a#ct} ;;
+    [0-9]*)   n=$a ;;
+    *) die "invalid container name: $a (use ctN or N)" ;;
+  esac
+  [[ "$n" =~ ^[0-9]+$ ]] || die "invalid container name: $a"
+  [ "$n" -ge 1 ] && [ "$n" -le "$(ct_max)" ] || die "N must be 1..$(ct_max) (CT_SLICE_SIZE=$CT_SLICE_SIZE)"
+  echo "ct$n"
+}
+
+ct_n()  { echo "${1#ct}"; }
+
+ct_ip() {  # $1 = N -> IP within this host's slice
+  local base_last=${CT_IP_BASE##*.} prefix=${CT_IP_BASE%.*}
+  echo "$prefix.$((base_last + $1))"
+}
+
+slice_prefix_len() {  # CT_SLICE_SIZE -> CIDR prefix length
+  local s=$CT_SLICE_SIZE p=32
+  while [ "$s" -gt 1 ]; do s=$((s / 2)); p=$((p - 1)); done
+  echo "$p"
+}
+
+ct_exists()  { [ -e "$CT_LXC_DIR/$1" ]; }
+ct_running() { lxc-info -n "$1" -s 2>/dev/null | grep -q RUNNING; }
+ct_all()     { find "$CT_LXC_DIR" -maxdepth 1 -name 'ct[0-9]*' -printf '%f\n' 2>/dev/null | sort -V; }
+unit_of()    { echo "ct@$(ct_n "$1")"; }
+dropin_of()  { echo "/etc/systemd/system/ct@$(ct_n "$1").service.d/50-resources.conf"; }
+
+# --- gcloud -----------------------------------------------------------------
+gcloud_ready() {
+  [ -n "$CT_DNS_PROJECT" ] || return 1
+  command -v gcloud >/dev/null 2>&1 || return 1
+  if [ -n "$CT_GCLOUD_KEY_FILE" ]; then
+    [ -f "$CT_GCLOUD_KEY_FILE" ] || { warn "CT_GCLOUD_KEY_FILE not found: $CT_GCLOUD_KEY_FILE"; return 1; }
+    export CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$CT_GCLOUD_KEY_FILE"
+  fi
+  return 0
+}
+
+dns_upsert() {  # $1=name $2=type $3=rrdata  (warn, never die)
+  run gcloud dns record-sets update "$1" --type="$2" --zone="$CT_GCP_DNS_ZONE_NAME" \
+      --rrdatas="$3" --ttl="$CT_DNS_TTL" --project="$CT_DNS_PROJECT" >/dev/null 2>&1 \
+  || run gcloud dns record-sets create "$1" --type="$2" --zone="$CT_GCP_DNS_ZONE_NAME" \
+      --rrdatas="$3" --ttl="$CT_DNS_TTL" --project="$CT_DNS_PROJECT" >/dev/null 2>&1 \
+  || warn "DNS upsert failed: $1 $2 -> $3"
+}
+
+dns_delete() {  # $1=name $2=type
+  run gcloud dns record-sets delete "$1" --type="$2" \
+      --zone="$CT_GCP_DNS_ZONE_NAME" --project="$CT_DNS_PROJECT" >/dev/null 2>&1 \
+  || warn "DNS delete failed: $1 $2 (may not exist)"
+}
+
+metadata() {  # $1 = metadata path (relative); empty output if unreachable
+  curl -sf --max-time 3 -H "Metadata-Flavor: Google" \
+    "http://169.254.169.254/computeMetadata/v1/$1" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# Resource knobs
+#   R_* holds effective values. Populated from config (CT_*) then CLI flags.
+# ---------------------------------------------------------------------------
+res_from_config() {
+  R_MEM_MAX=$CT_MEM_MAX       R_MEM_HIGH=$CT_MEM_HIGH
+  R_MEM_PROTECT=$CT_MEM_PROTECT R_MEM_RESERVE=$CT_MEM_RESERVE
+  R_CPU_MAX=$CT_CPU_MAX       R_CPU_WEIGHT=$CT_CPU_WEIGHT   R_CPU_PIN=$CT_CPU_PIN
+  R_IO_READ_MAX=$CT_IO_READ_MAX   R_IO_WRITE_MAX=$CT_IO_WRITE_MAX
+  R_IO_READ_IOPS=$CT_IO_READ_IOPS R_IO_WRITE_IOPS=$CT_IO_WRITE_IOPS
+  R_TASKS_MAX=$CT_TASKS_MAX
+}
+
+check_bytes() {  # $1=value $2=flagname  (systemd size: plain bytes or K/M/G/T)
+  [[ "$1" =~ ^[0-9]+[KMGT]?$ ]] || die "$2: '$1' - use bytes with optional K/M/G/T suffix (host RAM: $(host_mem_h))"
+}
+check_cores() {  # decimal cores
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "$2: '$1' - use decimal cores, 0 < value <= $(host_cores) (this host has $(host_cores) cores)"
+  awk -v v="$1" -v c="$(host_cores)" 'BEGIN{exit !(v>0 && v<=c)}' \
+    || die "$2: '$1' out of range - this host has $(host_cores) cores (max $(host_cores), e.g. 1.5)"
+}
+check_weight() {
+  [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 10000 ] \
+    || die "$2: '$1' - CPUWeight range is 1..10000 (100 = normal; purely relative, only matters when the host is CPU-saturated)"
+}
+check_iops() {
+  [[ "$1" =~ ^[0-9]+[KMGT]?$ ]] || die "$2: '$1' - operations/sec (plain number)"
+}
+check_tasks() {
+  [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] || die "$2: '$1' - max processes/threads, 1..$(cat /proc/sys/kernel/pid_max)"
+}
+check_pin() {
+  [[ "$1" =~ ^[0-9,-]+$ ]] || die "$2: '$1' - CPU list like 0-3 or 0,2 (this host: 0-$(( $(host_cores) - 1 )))"
+}
+
+# res_parse_flag <flag> <value> -> 0 if consumed, 1 if not a resource flag
+res_parse_flag() {
+  case "$1" in
+    --mem-max)      check_bytes  "$2" "$1"; R_MEM_MAX=$2 ;;
+    --mem-high)     check_bytes  "$2" "$1"; R_MEM_HIGH=$2 ;;
+    --mem-protect)  check_bytes  "$2" "$1"; R_MEM_PROTECT=$2 ;;
+    --mem-reserve)  check_bytes  "$2" "$1"; R_MEM_RESERVE=$2 ;;
+    --cpu-max)      check_cores  "$2" "$1"; R_CPU_MAX=$2 ;;
+    --cpu-weight)   check_weight "$2" "$1"; R_CPU_WEIGHT=$2 ;;
+    --cpu-pin)      check_pin    "$2" "$1"; R_CPU_PIN=$2 ;;
+    --io-read-max)  check_bytes  "$2" "$1"; R_IO_READ_MAX=$2 ;;
+    --io-write-max) check_bytes  "$2" "$1"; R_IO_WRITE_MAX=$2 ;;
+    --io-read-iops) check_iops   "$2" "$1"; R_IO_READ_IOPS=$2 ;;
+    --io-write-iops) check_iops  "$2" "$1"; R_IO_WRITE_IOPS=$2 ;;
+    --tasks-max)    check_tasks  "$2" "$1"; R_TASKS_MAX=$2 ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+cpu_max_to_quota() {  # decimal cores -> systemd CPUQuota percent (e.g. 1.5 -> 150%)
+  awk -v v="$1" 'BEGIN{printf "%d%%", v*100}'
+}
+
+# write_dropin <ct> : writes drop-in iff any knob differs from template values,
+# else removes an existing drop-in. Never calls daemon-reload itself.
+write_dropin() {
+  local ct=$1 dropin lines="" dev
+  dropin=$(dropin_of "$ct")
+  dev=$(lxc_backing_dev)
+
+  [ "$R_MEM_MAX" != "$TPL_MEM_MAX" ]      && lines+="MemoryMax=$R_MEM_MAX"$'\n'
+  [ "$R_MEM_HIGH" != "$TPL_MEM_HIGH" ]    && lines+="MemoryHigh=$R_MEM_HIGH"$'\n'
+  [ -n "$R_MEM_PROTECT" ]                 && lines+="MemoryLow=$R_MEM_PROTECT"$'\n'
+  [ -n "$R_MEM_RESERVE" ]                 && lines+="MemoryMin=$R_MEM_RESERVE"$'\n'
+  [ -n "$R_CPU_MAX" ]                     && lines+="CPUQuota=$(cpu_max_to_quota "$R_CPU_MAX")"$'\n'
+  [ "$R_CPU_WEIGHT" != "$TPL_CPU_WEIGHT" ] && lines+="CPUWeight=$R_CPU_WEIGHT"$'\n'
+  [ -n "$R_CPU_PIN" ]                     && lines+="AllowedCPUs=$R_CPU_PIN"$'\n'
+  [ -n "$R_IO_READ_MAX" ]                 && lines+="IOReadBandwidthMax=$dev $R_IO_READ_MAX"$'\n'
+  [ -n "$R_IO_WRITE_MAX" ]                && lines+="IOWriteBandwidthMax=$dev $R_IO_WRITE_MAX"$'\n'
+  [ -n "$R_IO_READ_IOPS" ]                && lines+="IOReadIOPSMax=$dev $R_IO_READ_IOPS"$'\n'
+  [ -n "$R_IO_WRITE_IOPS" ]               && lines+="IOWriteIOPSMax=$dev $R_IO_WRITE_IOPS"$'\n'
+  [ "$R_TASKS_MAX" != "$TPL_TASKS_MAX" ]  && lines+="TasksMax=$R_TASKS_MAX"$'\n'
+
+  if [ -z "$lines" ]; then
+    if [ -f "$dropin" ]; then
+      run rm -f "$dropin"
+      run rmdir --ignore-fail-on-non-empty "$(dirname "$dropin")"
+    fi
+    return 0
+  fi
+
+  write_file "$dropin" 644 <<EOF
+# $ct resource overrides - generated by 'ct' (edit via: ct set $ct ...)
+# Host: $(hostname -s) - $(host_cores) cores, $(host_mem_h) RAM, IO device $dev
+# These are CEILINGS/priorities, not reservations: nothing here dedicates
+# resources to this CT or takes them from others (only AllowedCPUs pins).
+# Ranges: mem 0..$(host_mem_h) | cpu-max 0..$(host_cores) cores | cpu-weight 1..10000 (100=normal)
+[Service]
+$lines
+EOF
+}
+
+# res_load_ctconf <ct> : populate R_* from the CT's ct.conf (falls back to config defaults)
+res_load_ctconf() {
+  local ct=$1
+  res_from_config
+  if [ -f "$CT_LXC_DIR/$ct/ct.conf" ]; then
+    # shellcheck disable=SC1090
+    . "$CT_LXC_DIR/$ct/ct.conf"
+    R_MEM_MAX=${CT_RES_MEM_MAX:-$R_MEM_MAX}
+    R_MEM_HIGH=${CT_RES_MEM_HIGH:-$R_MEM_HIGH}
+    R_MEM_PROTECT=${CT_RES_MEM_PROTECT:-}
+    R_MEM_RESERVE=${CT_RES_MEM_RESERVE:-}
+    R_CPU_MAX=${CT_RES_CPU_MAX:-}
+    R_CPU_WEIGHT=${CT_RES_CPU_WEIGHT:-$R_CPU_WEIGHT}
+    R_CPU_PIN=${CT_RES_CPU_PIN:-}
+    R_IO_READ_MAX=${CT_RES_IO_READ_MAX:-}
+    R_IO_WRITE_MAX=${CT_RES_IO_WRITE_MAX:-}
+    R_IO_READ_IOPS=${CT_RES_IO_READ_IOPS:-}
+    R_IO_WRITE_IOPS=${CT_RES_IO_WRITE_IOPS:-}
+    R_TASKS_MAX=${CT_RES_TASKS_MAX:-$R_TASKS_MAX}
+  fi
+}
+
+write_ctconf() {  # $1=ct $2=role $3=template_used
+  local ct=$1 role=$2 tpl=$3
+  write_file "$CT_LXC_DIR/$ct/ct.conf" 644 <<EOF
+# $ct metadata - generated by 'ct', read by list/info/set/destroy
+CT_NAME=$ct
+CT_NUM=$(ct_n "$ct")
+CT_IP=$(ct_ip "$(ct_n "$ct")")
+CT_ROLE=${role:-}
+CT_ALIAS=${CT_ALIAS:-}
+CT_TEMPLATE_USED=${tpl:-}
+CT_CREATED="${CT_CREATED_KEEP:-$(date -Is)}"
+CT_RES_MEM_MAX=$R_MEM_MAX
+CT_RES_MEM_HIGH=$R_MEM_HIGH
+CT_RES_MEM_PROTECT=$R_MEM_PROTECT
+CT_RES_MEM_RESERVE=$R_MEM_RESERVE
+CT_RES_CPU_MAX=$R_CPU_MAX
+CT_RES_CPU_WEIGHT=$R_CPU_WEIGHT
+CT_RES_CPU_PIN=$R_CPU_PIN
+CT_RES_IO_READ_MAX=$R_IO_READ_MAX
+CT_RES_IO_WRITE_MAX=$R_IO_WRITE_MAX
+CT_RES_IO_READ_IOPS=$R_IO_READ_IOPS
+CT_RES_IO_WRITE_IOPS=$R_IO_WRITE_IOPS
+CT_RES_TASKS_MAX=$R_TASKS_MAX
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# create
+# ---------------------------------------------------------------------------
+cmd_create() {
+  need_root
+  local name="" role="" alias_arg="" no_dns=0
+  local cli_res=()
+  res_from_config
+  while [ $# -gt 0 ]; do
+    if [ $# -ge 2 ] && res_parse_flag "$1" "$2"; then cli_res+=("$1" "$2"); shift 2; continue; fi
+    case "$1" in
+      --name)     name="${2:?--name needs ctN}"; shift 2 ;;
+      --config)   role="${2:?--config needs a name}"; shift 2 ;;
+      --alias)    alias_arg="${2:?--alias needs a name}"; shift 2 ;;
+      --template) CT_TEMPLATE="${2:?--template needs a path or name}"; shift 2 ;;
+      --no-dns)   no_dns=1; shift ;;
+      -h|--help)  usage_create; return 0 ;;
+      *) die "unknown argument: $1 (see: ct help create)" ;;
+    esac
+  done
+
+  # role config re-layers, then CLI resource flags win
+  if [ -n "$role" ]; then
+    load_role "$role"
+    res_from_config
+    set -- "${cli_res[@]}"
+    while [ $# -gt 0 ]; do res_parse_flag "$1" "$2"; shift 2; done
+  fi
+  [ -n "$alias_arg" ] && CT_ALIAS=$alias_arg
+
+  # ---- validation ----
+  local fstype usepct
+  fstype=$(findmnt -n -o FSTYPE --target "$CT_LXC_DIR")
+  [ "$fstype" = btrfs ] || die "$CT_LXC_DIR is not on btrfs (found: $fstype)"
+  usepct=$(df --output=pcent "$CT_LXC_DIR" | tail -1 | tr -dc 0-9)
+  [ "$usepct" -le 90 ] || die "less than 10% free on $CT_LXC_DIR (${usepct}% used)"
+  [ -f /etc/systemd/system/ct@.service ] || die "ct@.service template not installed (run: ct init)"
+
+  # ---- N / name / IP ----
+  local ct n
+  if [ -n "$name" ]; then
+    ct=$(norm_ct "$name"); n=$(ct_n "$ct")
+    ct_exists "$ct" && die "$CT_LXC_DIR/$ct already exists"
+  else
+    n=""
+    local i
+    for i in $(seq 1 "$(ct_max)"); do
+      [ ! -e "$CT_LXC_DIR/ct$i" ] && { n=$i; break; }
+    done
+    [ -n "$n" ] || die "no free CT slot (ct1..ct$(ct_max) all exist)"
+    ct="ct$n"
+  fi
+  local ip fqdn alias_fqdn=""
+  ip=$(ct_ip "$n")
+  fqdn="$ct.$(hostname -s).$CT_DNS_DOMAIN"
+  [ -n "$CT_ALIAS" ] && alias_fqdn="$CT_ALIAS.$CT_DNS_DOMAIN"
+
+  systemctl is-active --quiet "$(unit_of "$ct").service" 2>/dev/null && die "$(unit_of "$ct").service is already active"
+
+  # template sanity (name in CT_TEMPLATE_DIR or explicit path)
+  if [ -n "$CT_TEMPLATE" ] && [ ! -e "$CT_TEMPLATE" ]; then
+    [ -e "$CT_TEMPLATE_DIR/$CT_TEMPLATE" ] && CT_TEMPLATE="$CT_TEMPLATE_DIR/$CT_TEMPLATE" \
+      || die "template not found: $CT_TEMPLATE"
+  fi
+
+  # hook validation
+  local entry src
+  for entry in ${CT_HOOKS_CHROOT[@]+"${CT_HOOKS_CHROOT[@]}"} ${CT_HOOKS_ATTACH[@]+"${CT_HOOKS_ATTACH[@]}"}; do
+    # shellcheck disable=SC2086
+    eval set -- $entry
+    src=$(resolve_hook "$1")
+    [ -x "$src" ] || die "hook script not executable: $src (try: ct hooks pull)"
+  done
+
+  # DNS gating
+  local dns_ok=0
+  if [ "$no_dns" = 0 ] && gcloud_ready; then dns_ok=1; fi
+  [ "$no_dns" = 0 ] && [ -n "$CT_DNS_PROJECT" ] && [ "$dns_ok" = 0 ] && warn "gcloud not usable - skipping DNS updates"
+
+  # ---- idmap ----
+  local idmap_base need_end f entry_line s c newcount
+  idmap_base=$((CT_IDMAP_START + (n - 1) * CT_IDMAP_SIZE))
+  need_end=$((idmap_base + CT_IDMAP_SIZE))
+  for f in /etc/subuid /etc/subgid; do
+    entry_line=$(grep '^root:' "$f" || true)
+    [ -n "$entry_line" ] || die "no root entry in $f (run: ct init)"
+    s=$(echo "$entry_line" | cut -d: -f2); c=$(echo "$entry_line" | cut -d: -f3)
+    if [ "$idmap_base" -lt "$s" ] || [ "$need_end" -gt $((s + c)) ]; then
+      newcount=$((need_end - s))
+      info "extending root range in $f to $s:$newcount"
+      run sed -i "s/^root:$s:$c\$/root:$s:$newcount/" "$f"
+    fi
+  done
+
+  local rootfs=$CT_LXC_DIR/$ct/rootfs
+
+  # ---- plan summary ----
+  [ "$QUIET" = 1 ] || cat <<EOF
+=== ct create plan ===
+Name:       $ct
+IP:         $ip/32 (ipvlan l3s on $CT_LINK_IF)
+FQDN:       $fqdn $( [ "$dns_ok" = 1 ] && echo "(A record, zone $CT_GCP_DNS_ZONE_NAME @ $CT_DNS_PROJECT)" || echo "(no DNS update)" )
+Alias:      ${CT_ALIAS:-<none>}${alias_fqdn:+ -> CNAME $alias_fqdn}
+idmap:      u/g 0 $idmap_base $CT_IDMAP_SIZE
+Rootfs:     $rootfs $( [ -n "$CT_TEMPLATE" ] && echo "(from template: $CT_TEMPLATE)" || echo "(debootstrap $CT_CODENAME minbase)" )
+Unit:       $(unit_of "$ct").service (+ resource drop-in if non-default)
+Mem:        Max=$R_MEM_MAX High=$R_MEM_HIGH${R_MEM_PROTECT:+ Protect=$R_MEM_PROTECT}${R_MEM_RESERVE:+ Reserve=$R_MEM_RESERVE}
+CPU:        ${R_CPU_MAX:+Max=${R_CPU_MAX}cores }Weight=$R_CPU_WEIGHT${R_CPU_PIN:+ Pin=$R_CPU_PIN}  Tasks: $R_TASKS_MAX
+Hooks:      chroot=${CT_HOOKS_CHROOT[*]:-<none>} | attach=${CT_HOOKS_ATTACH[*]:-<none>}
+Configs:    built-in + defaults${role:+ + $role.conf}
+======================
+EOF
+
+  # ---- rootfs ----
+  if [ "$DRYRUN" = 1 ]; then
+    echo "DRY: btrfs subvolume create $CT_LXC_DIR/$ct"
+  else
+    btrfs subvolume create "$CT_LXC_DIR/$ct" >/dev/null
+  fi
+  if [ -n "$CT_TEMPLATE" ]; then
+    if [ -d "$CT_TEMPLATE" ]; then
+      info "snapshotting template subvolume"
+      run btrfs subvolume snapshot "$CT_TEMPLATE" "$rootfs" >/dev/null
+    else
+      info "extracting template tarball"
+      run mkdir -p "$rootfs"
+      case "$CT_TEMPLATE" in
+        *.tar.zst)      run tar --zstd -xf "$CT_TEMPLATE" -C "$rootfs" ;;
+        *.tar.gz|*.tgz) run tar -xzf "$CT_TEMPLATE" -C "$rootfs" ;;
+        *.tar)          run tar -xf "$CT_TEMPLATE" -C "$rootfs" ;;
+        *) die "unrecognized template type: $CT_TEMPLATE" ;;
+      esac
+    fi
+  else
+    info "running debootstrap ($CT_CODENAME)"
+    run debootstrap --variant=minbase --include="$CT_PACKAGES" \
+        "$CT_CODENAME" "$rootfs" "$CT_MIRROR"
+  fi
+
+  if [ "$DRYRUN" = 1 ]; then
+    info "dry-run: would stamp hostname/network/TZ/NTP, prep rootfs, run hooks, write unit drop-in + ct.conf, DNS upserts, enable + start"
+    return 0
+  fi
+
+  # ---- in-rootfs prep ----
+  echo "$ct" > "$rootfs/etc/hostname"
+  cat > "$rootfs/etc/hosts" <<EOF
+127.0.0.1 localhost
+$ip $ct $fqdn${CT_ALIAS:+ $alias_fqdn $CT_ALIAS}
+EOF
+  mkdir -p "$rootfs/etc/systemd/network"
+  cat > "$rootfs/etc/systemd/network/eth0.network" <<EOF
+[Match]
+Name=eth0
+
+[Network]
+Address=$ip/32
+DNS=169.254.169.254
+
+[Route]
+Destination=0.0.0.0/0
+Scope=link
+EOF
+  ln -sf "/usr/share/zoneinfo/$CT_TZ" "$rootfs/etc/localtime"
+  echo "$CT_TZ" > "$rootfs/etc/timezone"
+  sed -i 's/^#\?NTP=.*/NTP=169.254.169.254/' "$rootfs/etc/systemd/timesyncd.conf" 2>/dev/null || true
+  echo 'LANG=C.UTF-8' > "$rootfs/etc/default/locale"
+
+  if [ -n "$CT_ALIAS" ]; then
+    cat > "$rootfs/etc/profile.d/ct-alias.sh" <<EOF
+export CT_ALIAS=$CT_ALIAS
+PS1='\${debian_chroot:+(\$debian_chroot)}\\u@\\h[$CT_ALIAS]:\\w\\\$ '
+EOF
+  fi
+
+  if [ -z "$CT_TEMPLATE" ]; then
+    info "fresh-build prep (resolved install, service enables)"
+    echo 'nameserver 169.254.169.254' > "$rootfs/etc/resolv.conf"
+    chroot "$rootfs" /bin/bash <<'EOSH'
+set -e
+printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod +x /usr/sbin/policy-rc.d
+apt-get update -qq
+apt-get install -y -qq systemd-resolved
+rm /usr/sbin/policy-rc.d
+systemctl enable systemd-networkd systemd-resolved systemd-timesyncd
+passwd -d root >/dev/null
+printf 'cd /root\n[ -f ~/.bashrc ] && . ~/.bashrc\n' > /root/.bash_profile
+ln -sf /lib/systemd/system/poweroff.target /etc/systemd/system/reboot.target
+EOSH
+  fi
+
+  # ---- copy hook scripts into CT ----
+  if [ "${#CT_HOOKS_CHROOT[@]}" -gt 0 ] || [ "${#CT_HOOKS_ATTACH[@]}" -gt 0 ]; then
+    mkdir -p "$rootfs$CT_SCRIPTS_TARGET"
+    for entry in ${CT_HOOKS_CHROOT[@]+"${CT_HOOKS_CHROOT[@]}"} ${CT_HOOKS_ATTACH[@]+"${CT_HOOKS_ATTACH[@]}"}; do
+      # shellcheck disable=SC2086
+      eval set -- $entry
+      src=$(resolve_hook "$1")
+      cp "$src" "$rootfs$CT_SCRIPTS_TARGET/$(basename "$src")"
+      chmod 755 "$rootfs$CT_SCRIPTS_TARGET/$(basename "$src")"
+    done
+  fi
+
+  # ---- chroot hooks ----
+  if [ "${#CT_HOOKS_CHROOT[@]}" -gt 0 ]; then
+    local saved
+    saved=$(readlink "$rootfs/etc/resolv.conf" 2>/dev/null || true)
+    rm -f "$rootfs/etc/resolv.conf"
+    echo 'nameserver 169.254.169.254' > "$rootfs/etc/resolv.conf"
+    for entry in "${CT_HOOKS_CHROOT[@]}"; do
+      # shellcheck disable=SC2086
+      eval set -- $entry
+      local s
+      s="$CT_SCRIPTS_TARGET/$(basename "$1")"; shift
+      info "running chroot hook: $s $*"
+      chroot "$rootfs" "$s" "$@"
+    done
+    [ -n "$saved" ] && ln -sf "$saved" "$rootfs/etc/resolv.conf"
+  fi
+
+  ln -sf /run/systemd/resolve/stub-resolv.conf "$rootfs/etc/resolv.conf"
+  truncate -s0 "$rootfs/etc/machine-id"
+
+  # ---- LXC config ----
+  cat > "$CT_LXC_DIR/$ct/config" <<EOF
+lxc.uts.name = $ct
+lxc.arch = amd64
+lxc.include = /usr/share/lxc/config/common.conf
+lxc.include = /usr/share/lxc/config/userns.conf
+lxc.mount.auto = proc:mixed sys:ro cgroup:mixed
+lxc.idmap = u 0 $idmap_base $CT_IDMAP_SIZE
+lxc.idmap = g 0 $idmap_base $CT_IDMAP_SIZE
+lxc.rootfs.path = dir:$rootfs
+lxc.rootfs.options = idmap=container
+lxc.apparmor.profile = unconfined
+
+lxc.net.0.type = ipvlan
+lxc.net.0.ipvlan.mode = l3s
+lxc.net.0.link = $CT_LINK_IF
+lxc.net.0.flags = up
+lxc.net.0.name = eth0
+EOF
+
+  # ---- unit drop-in + per-CT metadata ----
+  write_dropin "$ct"
+  write_ctconf "$ct" "$role" "$CT_TEMPLATE"
+  systemctl daemon-reload
+
+  # ---- host ssh user ----
+  if ! getent passwd "$ct" >/dev/null; then
+    info "adding host user $ct"
+    useradd -o -u "$CT_SSH_UID" -g "$CT_SSH_GID" -M -d / -s /bin/bash "$ct"
+  fi
+
+  # ---- DNS ----
+  if [ "$dns_ok" = 1 ]; then
+    info "DNS: A $fqdn -> $ip"
+    dns_upsert "$fqdn." A "$ip"
+    if [ -n "$alias_fqdn" ]; then
+      info "DNS: CNAME $alias_fqdn -> $fqdn"
+      dns_upsert "$alias_fqdn." CNAME "$fqdn."
+    fi
+  fi
+
+  # ---- start ----
+  info "starting $(unit_of "$ct").service"
+  systemctl enable --now "$(unit_of "$ct").service"
+
+  info "waiting for $ct to reach RUNNING"
+  local up=0 i
+  for i in $(seq 1 30); do
+    ct_running "$ct" && { up=1; break; }
+    sleep 1
+  done
+  [ "$up" = 1 ] || die "$ct failed to reach RUNNING within 30s - check: journalctl -u $(unit_of "$ct") ; lxc-start -n $ct -F -l DEBUG -o /tmp/$ct.log"
+
+  # ---- attach hooks ----
+  if [ "${#CT_HOOKS_ATTACH[@]}" -gt 0 ]; then
+    sleep 2
+    for entry in "${CT_HOOKS_ATTACH[@]}"; do
+      # shellcheck disable=SC2086
+      eval set -- $entry
+      local s
+      s="$CT_SCRIPTS_TARGET/$(basename "$1")"; shift
+      info "running attach hook: $s $*"
+      lxc-attach -n "$ct" --clear-env -- "$s" "$@"
+    done
+  fi
+
+  [ "$QUIET" = 1 ] || cat <<EOF
+
+=== $ct created ===
+IP:      $ip
+FQDN:    $fqdn${alias_fqdn:+  (alias: $alias_fqdn)}
+idmap:   $idmap_base:$CT_IDMAP_SIZE
+Unit:    $(unit_of "$ct").service (enabled)
+Console: ssh $ct@$(hostname -s)   or   ct attach $ct
+===================
+EOF
+}
+
+resolve_hook() {  # $1=scriptname -> echoes host path
+  case "$1" in
+    */*) echo "$1" ;;
+    *)   echo "$CT_HOOK_SCRIPTS_DIR/$1" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# destroy
+# ---------------------------------------------------------------------------
+cmd_destroy() {
+  need_root
+  local ct="" yes=0 force=0 purge=0 keep_dns=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes)      yes=1; shift ;;
+      --force)    force=1; shift ;;
+      --purge)    purge=1; shift ;;
+      --keep-dns) keep_dns=1; shift ;;
+      -h|--help)  usage_destroy; return 0 ;;
+      -*) die "unknown argument: $1 (see: ct help destroy)" ;;
+      *)  ct=$(norm_ct "$1"); shift ;;
+    esac
+  done
+  [ -n "$ct" ] || die "container name required (ctN)"
+  ct_exists "$ct" || die "$CT_LXC_DIR/$ct does not exist"
+
+  local running=0 alias="" unit
+  ct_running "$ct" && running=1
+  [ "$running" = 1 ] && [ "$force" = 0 ] && die "$ct is running (use --force to stop it)"
+  unit=$(unit_of "$ct")
+
+  # alias from ct.conf (new) or legacy stamp file
+  if [ -f "$CT_LXC_DIR/$ct/ct.conf" ]; then
+    # shellcheck disable=SC1090
+    alias=$(. "$CT_LXC_DIR/$ct/ct.conf" && echo "${CT_ALIAS:-}")
+  elif [ -f "$CT_LXC_DIR/$ct/alias" ]; then
+    alias=$(cat "$CT_LXC_DIR/$ct/alias")
+  fi
+
+  [ "$QUIET" = 1 ] || cat <<EOF
+=== ct destroy plan ===
+Name:    $ct $( [ "$running" = 1 ] && echo "(RUNNING - will stop)" )
+Rootfs:  $CT_LXC_DIR/$ct (delete)
+Alias:   ${alias:-<none>}${alias:+ (CNAME $alias.$CT_DNS_DOMAIN $( [ "$keep_dns" = 1 ] && echo kept || echo removed ))}
+Unit:    $unit.service $( [ "$purge" = 1 ] && echo "(disable + remove drop-in)" || echo "(disable, keep drop-in)" )
+User:    $ct $( [ "$purge" = 1 ] && echo "(remove)" || echo "(keep)" )
+=======================
+EOF
+  if [ "$DRYRUN" = 1 ]; then info "dry-run: no changes made"; return 0; fi
+  [ "$yes" = 1 ] || die "refusing without --yes"
+
+  run systemctl disable --now "$unit.service" 2>/dev/null || true
+  ct_running "$ct" && run lxc-stop -n "$ct"
+
+  if [ -n "$alias" ] && [ "$keep_dns" = 0 ] && gcloud_ready; then
+    info "removing CNAME $alias.$CT_DNS_DOMAIN"
+    dns_delete "$alias.$CT_DNS_DOMAIN." CNAME
+  fi
+
+  if btrfs subvolume show "$CT_LXC_DIR/$ct/rootfs" >/dev/null 2>&1; then
+    run btrfs subvolume delete "$CT_LXC_DIR/$ct/rootfs" >/dev/null
+  else
+    run rm -rf "$CT_LXC_DIR/$ct/rootfs"
+  fi
+  run rm -f "$CT_LXC_DIR/$ct/config" "$CT_LXC_DIR/$ct/alias" "$CT_LXC_DIR/$ct/ct.conf"
+  if btrfs subvolume show "$CT_LXC_DIR/$ct" >/dev/null 2>&1; then
+    run btrfs subvolume delete "$CT_LXC_DIR/$ct" >/dev/null
+  else
+    run rm -rf "$CT_LXC_DIR/$ct"
+  fi
+
+  if [ "$purge" = 1 ]; then
+    run rm -rf "/etc/systemd/system/$unit.service.d"
+    run systemctl daemon-reload
+    getent passwd "$ct" >/dev/null && run userdel "$ct"
+  fi
+  info "$ct destroyed$( [ "$purge" = 1 ] && echo " (purged)" )"
+}
+
+# ---------------------------------------------------------------------------
+# attach / exec
+# ---------------------------------------------------------------------------
+cmd_attach() {
+  need_root
+  [ $# -ge 1 ] || die "usage: ct attach <ctN>"
+  [ "$1" = -h ] || [ "$1" = --help ] && { usage_attach; return 0; }
+  local ct; ct=$(norm_ct "$1")
+  ct_running "$ct" || die "$ct is not running"
+  exec lxc-attach -n "$ct" --clear-env --keep-var TERM -- /bin/bash --login
+}
+
+cmd_exec() {
+  need_root
+  [ $# -ge 1 ] || die "usage: ct exec <ctN> -- <command> [args...]"
+  [ "$1" = -h ] || [ "$1" = --help ] && { usage_exec; return 0; }
+  local ct; ct=$(norm_ct "$1"); shift
+  [ "${1:-}" = "--" ] && shift
+  [ $# -ge 1 ] || die "usage: ct exec <ctN> -- <command> [args...]"
+  ct_running "$ct" || die "$ct is not running"
+  exec lxc-attach -n "$ct" --clear-env --keep-var TERM -- "$@"
+}
+
+# ---------------------------------------------------------------------------
+# list / info
+# ---------------------------------------------------------------------------
+cmd_list() {
+  local filter="" ct state ip alias role memmax cpumax weight
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --running) filter=RUNNING; shift ;;
+      --stopped) filter=STOPPED; shift ;;
+      -h|--help) usage_list; return 0 ;;
+      *) die "unknown argument: $1 (see: ct help list)" ;;
+    esac
+  done
+  printf "%-6s %-9s %-14s %-12s %-10s %-8s %-8s %-6s\n" \
+    NAME STATE IP ALIAS ROLE MEM-MAX CPU-MAX WEIGHT
+  for ct in $(ct_all); do
+    state=$(lxc-info -n "$ct" -s 2>/dev/null | awk '{print $2}')
+    state=${state:-STOPPED}
+    [ -n "$filter" ] && [ "$state" != "$filter" ] && continue
+    res_load_ctconf "$ct"
+    ip=$(ct_ip "$(ct_n "$ct")"); alias="-"; role="-"
+    if [ -f "$CT_LXC_DIR/$ct/ct.conf" ]; then
+      # shellcheck disable=SC1090
+      alias=$(. "$CT_LXC_DIR/$ct/ct.conf" && echo "${CT_ALIAS:--}")
+      # shellcheck disable=SC1090
+      role=$(. "$CT_LXC_DIR/$ct/ct.conf" && echo "${CT_ROLE:--}")
+    fi
+    memmax=$R_MEM_MAX; cpumax=${R_CPU_MAX:--}; weight=$R_CPU_WEIGHT
+    printf "%-6s %-9s %-14s %-12s %-10s %-8s %-8s %-6s\n" \
+      "$ct" "$state" "$ip" "${alias:--}" "${role:--}" "$memmax" "$cpumax" "$weight"
+  done
+}
+
+cmd_info() {
+  [ $# -ge 1 ] || die "usage: ct info <ctN>"
+  [ "$1" = -h ] || [ "$1" = --help ] && { usage_info; return 0; }
+  local ct unit n
+  ct=$(norm_ct "$1"); n=$(ct_n "$ct"); unit=$(unit_of "$ct")
+  ct_exists "$ct" || die "$ct does not exist"
+  echo "=== $ct ==="
+  lxc-info -n "$ct" 2>/dev/null | sed 's/^/  /' || echo "  State: STOPPED"
+  echo "  IP:        $(ct_ip "$n")"
+  echo "  idmap:     u/g 0 $((CT_IDMAP_START + (n - 1) * CT_IDMAP_SIZE)) $CT_IDMAP_SIZE"
+  echo "  Unit:      $unit.service ($(systemctl is-enabled "$unit.service" 2>/dev/null || echo not-installed))"
+  if [ -f "$CT_LXC_DIR/$ct/ct.conf" ]; then
+    echo "  --- ct.conf ---"
+    sed 's/^/  /' "$CT_LXC_DIR/$ct/ct.conf" | grep -v '^  #'
+  else
+    echo "  (no ct.conf - pre-refactor container)"
+  fi
+  if [ -f "$(dropin_of "$ct")" ]; then
+    echo "  --- resource drop-in ($(dropin_of "$ct")) ---"
+    grep -v '^#' "$(dropin_of "$ct")" | sed 's/^/  /'
+  else
+    echo "  Resources: template defaults (no drop-in)"
+  fi
+  if ct_running "$ct"; then
+    echo "  --- effective (systemd) ---"
+    systemctl show "$unit.service" \
+      -p MemoryMax,MemoryHigh,MemoryLow,MemoryMin,CPUQuotaPerSecUSec,CPUWeight,AllowedCPUs,TasksMax 2>/dev/null \
+      | sed 's/^/  /'
+  fi
+  local snaps
+  snaps=$(ls -d "$CT_SNAP_DIR/$ct-"* 2>/dev/null | wc -l)
+  echo "  Snapshots: $snaps"
+}
+
+# ---------------------------------------------------------------------------
+# start / stop / restart
+# ---------------------------------------------------------------------------
+svc_verb() {  # $1=verb, rest = cts or --all
+  need_root
+  local verb=$1; shift
+  local targets=() a
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) mapfile -t targets < <(ct_all); shift ;;
+      -h|--help) echo "usage: ct $verb <ctN> [ctN...] | --all"; return 0 ;;
+      *) targets+=("$(norm_ct "$1")"); shift ;;
+    esac
+  done
+  [ "${#targets[@]}" -gt 0 ] || die "usage: ct $verb <ctN> [ctN...] | --all"
+  for a in "${targets[@]}"; do
+    ct_exists "$a" || die "$a does not exist"
+    info "$verb $a"
+    run systemctl "$verb" "$(unit_of "$a").service"
+  done
+}
+cmd_start()   { svc_verb start "$@"; }
+cmd_stop()    { svc_verb stop "$@"; }
+cmd_restart() { svc_verb restart "$@"; }
+
+# ---------------------------------------------------------------------------
+# set
+# ---------------------------------------------------------------------------
+cmd_set() {
+  need_root
+  [ $# -ge 1 ] || { usage_set; return 1; }
+  [ "$1" = -h ] || [ "$1" = --help ] && { usage_set; return 0; }
+  local ct new_alias="" live=0 changed=0
+  ct=$(norm_ct "$1"); shift
+  ct_exists "$ct" || die "$ct does not exist"
+  res_load_ctconf "$ct"
+  local old_alias="${CT_ALIAS:-}" role="${CT_ROLE:-}" tpl="${CT_TEMPLATE_USED:-}" created="${CT_CREATED:-}"
+
+  while [ $# -gt 0 ]; do
+    if [ $# -ge 2 ] && res_parse_flag "$1" "$2"; then changed=1; shift 2; continue; fi
+    case "$1" in
+      --alias) new_alias="${2:?--alias needs a name}"; shift 2 ;;
+      --live)  live=1; shift ;;
+      *) die "unknown argument: $1 (see: ct help set)" ;;
+    esac
+  done
+  [ "$changed" = 1 ] || [ -n "$new_alias" ] || die "nothing to change (see: ct help set)"
+
+  # rewrite drop-in + ct.conf
+  write_dropin "$ct"
+  CT_ALIAS=${new_alias:-$old_alias}
+  CT_CREATED_KEEP=$created write_ctconf "$ct" "$role" "$tpl"
+  run systemctl daemon-reload
+
+  # live application (running CT only; cgroup props only)
+  if [ "$live" = 1 ] && ct_running "$ct"; then
+    local props=()
+    props+=("MemoryMax=$R_MEM_MAX" "MemoryHigh=$R_MEM_HIGH")
+    [ -n "$R_MEM_PROTECT" ] && props+=("MemoryLow=$R_MEM_PROTECT")
+    [ -n "$R_MEM_RESERVE" ] && props+=("MemoryMin=$R_MEM_RESERVE")
+    [ -n "$R_CPU_MAX" ] && props+=("CPUQuota=$(cpu_max_to_quota "$R_CPU_MAX")")
+    props+=("CPUWeight=$R_CPU_WEIGHT" "TasksMax=$R_TASKS_MAX")
+    [ -n "$R_CPU_PIN" ] && props+=("AllowedCPUs=$R_CPU_PIN")
+    info "applying live: ${props[*]}"
+    run systemctl set-property --runtime "$(unit_of "$ct").service" "${props[@]}"
+    [ -n "$R_IO_READ_MAX$R_IO_WRITE_MAX$R_IO_READ_IOPS$R_IO_WRITE_IOPS" ] \
+      && warn "IO limits are not applied live - restart the CT to apply them"
+  elif [ "$live" = 1 ]; then
+    warn "--live: $ct not running, drop-in will apply on next start"
+  else
+    info "saved - applies on next restart (use --live to apply now)"
+  fi
+
+  # alias change: DNS + in-CT stamps
+  if [ -n "$new_alias" ] && [ "$new_alias" != "$old_alias" ]; then
+    local fqdn rootfs
+    fqdn="$ct.$(hostname -s).$CT_DNS_DOMAIN"
+    rootfs="$CT_LXC_DIR/$ct/rootfs"
+    if gcloud_ready; then
+      [ -n "$old_alias" ] && dns_delete "$old_alias.$CT_DNS_DOMAIN." CNAME
+      dns_upsert "$new_alias.$CT_DNS_DOMAIN." CNAME "$fqdn."
+    fi
+    if [ "$DRYRUN" = 0 ]; then
+      cat > "$rootfs/etc/profile.d/ct-alias.sh" <<EOF
+export CT_ALIAS=$new_alias
+PS1='\${debian_chroot:+(\$debian_chroot)}\\u@\\h[$new_alias]:\\w\\\$ '
+EOF
+      sed -i "s/^$(ct_ip "$(ct_n "$ct")") .*/$(ct_ip "$(ct_n "$ct")") $ct $fqdn $new_alias.$CT_DNS_DOMAIN $new_alias/" "$rootfs/etc/hosts"
+    fi
+    info "alias: ${old_alias:-<none>} -> $new_alias"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# hooks
+# ---------------------------------------------------------------------------
+cmd_hooks() {
+  local sub=${1:-list}; shift || true
+  case "$sub" in
+    list)
+      echo "local hook scripts ($CT_HOOK_SCRIPTS_DIR):"
+      ls -1 "$CT_HOOK_SCRIPTS_DIR" 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+      if [ -n "$CT_HOOKS_REPO_URL" ] && command -v git >/dev/null 2>&1; then
+        echo "remote ($CT_HOOKS_REPO_URL):"
+        local tmp
+        tmp=$(mktemp -d)
+        if git clone -q --depth 1 "$CT_HOOKS_REPO_URL" "$tmp/repo" 2>/dev/null; then
+          find "$tmp/repo" -maxdepth 1 -name '*.sh' ! -name '_*' -printf '  %f\n' | sort
+        else
+          warn "could not reach hooks repo"
+        fi
+        rm -rf "$tmp"
+      fi
+      ;;
+    pull)
+      need_root
+      [ -n "$CT_HOOKS_REPO_URL" ] || die "CT_HOOKS_REPO_URL not set in $CONFDIR/defaults.conf"
+      command -v git >/dev/null 2>&1 || die "git is required for 'ct hooks pull'"
+      local tmp names=("$@")
+      tmp=$(mktemp -d)
+      info "cloning $CT_HOOKS_REPO_URL"
+      git clone -q --depth 1 "$CT_HOOKS_REPO_URL" "$tmp/repo" || { rm -rf "$tmp"; die "clone failed: $CT_HOOKS_REPO_URL"; }
+      run mkdir -p "$CT_HOOK_SCRIPTS_DIR"
+      local f count=0
+      if [ "${#names[@]}" -gt 0 ]; then
+        for f in "${names[@]}"; do
+          [ -f "$tmp/repo/$f" ] || { warn "not in repo: $f"; continue; }
+          run install -m 755 "$tmp/repo/$f" "$CT_HOOK_SCRIPTS_DIR/$f"
+          count=$((count + 1))
+        done
+      else
+        for f in "$tmp/repo"/*.sh; do
+          [ -f "$f" ] || continue
+          case "$(basename "$f")" in _*) continue ;; esac
+          run install -m 755 "$f" "$CT_HOOK_SCRIPTS_DIR/$(basename "$f")"
+          count=$((count + 1))
+        done
+      fi
+      rm -rf "$tmp"
+      info "pulled $count hook script(s) into $CT_HOOK_SCRIPTS_DIR"
+      ;;
+    -h|--help|*) usage_hooks ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# init  (host bootstrap; idempotent; --check = report only)
+# ---------------------------------------------------------------------------
+init_status() { printf "  %-38s %s\n" "$1" "$2"; }
+
+cmd_init() {
+  need_root
+  local check=0 force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --check) check=1; shift ;;
+      --force) force=1; shift ;;
+      -h|--help) usage_init; return 0 ;;
+      *) die "unknown argument: $1 (see: ct help init)" ;;
+    esac
+  done
+  [ "$check" = 1 ] && info "init --check: report only, no changes" && DRYRUN=1
+
+  # -- packages --
+  local pkgs=(lxc debootstrap btrfs-progs nftables) p missing=()
+  for p in "${pkgs[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    init_status "packages: ${missing[*]}" "INSTALL"
+    run apt-get install -y --no-install-recommends "${missing[@]}"
+  else
+    init_status "packages (${pkgs[*]})" "ok"
+  fi
+
+  # -- lxc-net + ssh-generator masks --
+  if systemctl is-enabled lxc-net >/dev/null 2>&1; then
+    init_status "lxc-net" "DISABLE+MASK"
+    run systemctl disable --now lxc-net 2>/dev/null || true
+    run systemctl mask lxc-net
+  else
+    init_status "lxc-net (masked/absent)" "ok"
+  fi
+  if [ ! -e /etc/systemd/system-generators/systemd-ssh-generator ]; then
+    init_status "systemd-ssh-generator mask" "CREATE"
+    run mkdir -p /etc/systemd/system-generators
+    run ln -sf /dev/null /etc/systemd/system-generators/systemd-ssh-generator
+  else
+    init_status "systemd-ssh-generator mask" "ok"
+  fi
+
+  # -- sysctls --
+  if [ ! -f /etc/sysctl.d/90-ct.conf ]; then
+    init_status "sysctls (/etc/sysctl.d/90-ct.conf)" "CREATE"
+    write_file /etc/sysctl.d/90-ct.conf 644 <<'EOF'
+# ct: LXC host requirements (ipvlan l3s)
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+EOF
+    run sysctl -q --load=/etc/sysctl.d/90-ct.conf
+  else
+    init_status "sysctls" "ok"
+  fi
+
+  # -- subuid/subgid --
+  local f want_count=1048576
+  for f in /etc/subuid /etc/subgid; do
+    if ! grep -q '^root:' "$f" 2>/dev/null; then
+      init_status "$f root entry" "CREATE"
+      run bash -c "echo 'root:$CT_IDMAP_START:$want_count' >> $f"
+    else
+      init_status "$f root entry" "ok"
+    fi
+  done
+
+  # -- ssh console access --
+  if ! getent group ctadmin >/dev/null; then
+    init_status "group ctadmin ($CT_SSH_GID)" "CREATE"
+    run groupadd -g "$CT_SSH_GID" ctadmin
+  else
+    init_status "group ctadmin" "ok"
+  fi
+  if ! getent passwd ctadmin >/dev/null; then
+    init_status "user ctadmin" "CREATE"
+    run useradd -o -u "$CT_SSH_UID" -g "$CT_SSH_GID" -M -d / -s /bin/bash ctadmin
+  else
+    init_status "user ctadmin" "ok"
+  fi
+  if [ ! -f /etc/ssh/ct_authorized_keys ]; then
+    init_status "/etc/ssh/ct_authorized_keys" "CREATE (empty - add the shared pubkey)"
+    write_file /etc/ssh/ct_authorized_keys 644 </dev/null
+  else
+    init_status "/etc/ssh/ct_authorized_keys" "ok"
+  fi
+  if ! grep -rq ct_authorized_keys /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null; then
+    init_status "sshd ct Match block" "CREATE"
+    write_file /etc/ssh/sshd_config.d/50-ct.conf 644 <<'EOF'
+# ct: console access - ssh ctN@host lands in a root shell inside ctN
+DenyUsers ctadmin
+Match User ct*,!ctadmin
+    AuthorizedKeysFile /etc/ssh/ct_authorized_keys
+    ForceCommand sudo /usr/bin/lxc-attach -n "$USER" --clear-env --keep-var TERM -- /bin/bash --login
+    DisableForwarding yes
+    PermitTTY yes
+EOF
+    run systemctl reload ssh 2>/dev/null || true
+  else
+    init_status "sshd ct Match block" "ok"
+  fi
+  if [ ! -f /etc/sudoers.d/ctadmin ]; then
+    init_status "/etc/sudoers.d/ctadmin" "CREATE"
+    write_file /etc/sudoers.d/ctadmin 440 <<'EOF'
+%ctadmin ALL=(root) NOPASSWD: /usr/bin/lxc-attach -n ct[0-9]* --clear-env --keep-var TERM -- /bin/bash --login
+EOF
+  else
+    init_status "/etc/sudoers.d/ctadmin" "ok"
+  fi
+
+  # -- nftables --
+  if ! systemctl is-enabled nftables >/dev/null 2>&1; then
+    init_status "nftables.service" "ENABLE"
+    run systemctl enable --now nftables
+  else
+    init_status "nftables.service" "ok"
+  fi
+  if [ ! -f /etc/nftables.conf ] || ! grep -q 'ct-base' /etc/nftables.conf 2>/dev/null; then
+    if [ -f /etc/nftables.conf ] && grep -q 'table' /etc/nftables.conf 2>/dev/null; then
+      init_status "nftables.conf (existing, no ct-base)" "LEFT ALONE (add DNAT/policy manually)"
+    else
+      init_status "nftables.conf ct-base scaffold" "CREATE"
+      write_file /etc/nftables.conf 755 <<'EOF'
+#!/usr/sbin/nft -f
+# ct-base scaffold - CT traffic traverses host input/output hooks (ipvlan l3s),
+# NOT forward. Match on CT addresses. DNAT for external exposure goes in
+# the nat prerouting chain below.
+flush ruleset
+
+table inet nat {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    # example: ip daddr <external-ip> dnat to <ct-ip>
+  }
+}
+EOF
+      run systemctl restart nftables
+    fi
+  else
+    init_status "nftables.conf" "ok"
+  fi
+
+  # -- btrfs --
+  local fstype
+  fstype=$(findmnt -n -o FSTYPE --target "$CT_LXC_DIR" 2>/dev/null || true)
+  if [ "$fstype" = btrfs ]; then
+    init_status "$CT_LXC_DIR on btrfs" "ok"
+  else
+    init_status "$CT_LXC_DIR on btrfs" "MISSING - mount a btrfs disk there (found: ${fstype:-none})"
+  fi
+
+  # -- payloads --
+  local pf
+  for pf in defaults.conf mqtt.conf; do
+    if [ ! -f "$CONFDIR/$pf" ] || [ "$force" = 1 ]; then
+      init_status "$CONFDIR/$pf" "WRITE"
+      payload_conf "$pf" | write_file "$CONFDIR/$pf" 600
+    else
+      init_status "$CONFDIR/$pf" "ok (exists; --force overwrites)"
+    fi
+  done
+  if [ ! -f "$CT_HOOK_SCRIPTS_DIR/base.sh" ] || [ "$force" = 1 ]; then
+    init_status "$CT_HOOK_SCRIPTS_DIR/base.sh" "WRITE"
+    payload_base_sh | write_file "$CT_HOOK_SCRIPTS_DIR/base.sh" 755
+  else
+    init_status "$CT_HOOK_SCRIPTS_DIR/base.sh" "ok"
+  fi
+  if [ ! -f /etc/systemd/system/ct@.service ] || [ "$force" = 1 ]; then
+    init_status "/etc/systemd/system/ct@.service" "WRITE"
+    payload_unit | write_file /etc/systemd/system/ct@.service 644
+    run systemctl daemon-reload
+  else
+    init_status "/etc/systemd/system/ct@.service" "ok"
+  fi
+  if [ ! -f /etc/bash_completion.d/ct ] || [ "$force" = 1 ]; then
+    init_status "/etc/bash_completion.d/ct" "WRITE"
+    payload_completion | write_file /etc/bash_completion.d/ct 644
+  else
+    init_status "/etc/bash_completion.d/ct" "ok"
+  fi
+
+  # -- install self --
+  local self
+  self=$(readlink -f "$0")
+  if [ "$self" != /usr/local/sbin/ct ]; then
+    init_status "install self -> /usr/local/sbin/ct" "COPY"
+    run install -m 755 "$self" /usr/local/sbin/ct
+  else
+    init_status "/usr/local/sbin/ct" "ok"
+  fi
+
+  # -- GCE alias range (verify only; claiming is gcp-init's job) --
+  local aliases
+  aliases=$(metadata "instance/network-interfaces/0/ip-aliases/?recursive=true")
+  if [ -n "$aliases" ]; then
+    init_status "GCE alias range(s): $aliases" "ok"
+  else
+    init_status "GCE alias range" "MISSING - run: ct gcp-init (or add manually)"
+  fi
+
+  info "init done$( [ "$check" = 1 ] && echo " (check only)" ). Next: verify with 'ct doctor', then 'ct gcp-init' if GCP side is not set up."
+}
+
+# ---------------------------------------------------------------------------
+# gcp-init  (project/VPC bootstrap; needs gcloud)
+# ---------------------------------------------------------------------------
+cmd_gcp_init() {
+  need_root
+  local check=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --check) check=1; DRYRUN=1; shift ;;
+      -h|--help) usage_gcp_init; return 0 ;;
+      *) die "unknown argument: $1 (see: ct help gcp-init)" ;;
+    esac
+  done
+  command -v gcloud >/dev/null 2>&1 || die "gcloud is required for gcp-init"
+  [ -n "$CT_GCLOUD_KEY_FILE" ] && export CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$CT_GCLOUD_KEY_FILE"
+
+  local project zone region instance subnet
+  project=${CT_GCP_PROJECT:-$(metadata project/project-id)}
+  [ -n "$project" ] || die "cannot determine project (set CT_GCP_PROJECT in $CONFDIR/defaults.conf)"
+  zone=$(metadata instance/zone | awk -F/ '{print $NF}')
+  region=${zone%-*}
+  instance=$(metadata instance/name)
+  [ -n "$zone" ] || die "not on GCE (metadata server unreachable)"
+  subnet=$(gcloud compute instances describe "$instance" --zone "$zone" --project "$project" \
+    --format="value(networkInterfaces[0].subnetwork)" 2>/dev/null | awk -F/ '{print $NF}')
+  info "project=$project region=$region zone=$zone instance=$instance subnet=$subnet"
+
+  # -- secondary range 'containers' --
+  local pool=${CT_IP_BASE%.*}.0/24
+  if gcloud compute networks subnets describe "$subnet" --region "$region" --project "$project" \
+      --format="value(secondaryIpRanges)" 2>/dev/null | grep -q containers; then
+    init_status "secondary range 'containers'" "ok"
+  else
+    init_status "secondary range 'containers' ($pool)" "CREATE"
+    run gcloud compute networks subnets update "$subnet" --region "$region" --project "$project" \
+      --add-secondary-ranges "containers=$pool"
+  fi
+
+  # -- this instance's alias slice --
+  local slice have
+  slice="$CT_IP_BASE/$(slice_prefix_len)"
+  have=$(metadata "instance/network-interfaces/0/ip-aliases/?recursive=true")
+  if [ -n "$have" ]; then
+    init_status "alias range on $instance: $have" "ok (config expects $slice)"
+  else
+    # conflict check: any other instance already holding a range that contains our base?
+    local others
+    others=$(gcloud compute instances list --project "$project" \
+      --format="value(name,networkInterfaces[0].aliasIpRanges[].ipCidrRange.list())" 2>/dev/null | grep -v "^$instance" || true)
+    if echo "$others" | grep -q "$CT_IP_BASE"; then
+      init_status "alias slice $slice" "CONFLICT - already claimed:"
+      echo "$others" | sed 's/^/    /'
+      die "adjust CT_IP_BASE in $CONFDIR/defaults.conf to a free slice"
+    fi
+    init_status "alias slice $slice on $instance" "CLAIM"
+    run gcloud compute instances network-interfaces update "$instance" --zone "$zone" --project "$project" \
+      --aliases "containers:$slice"
+    [ "$check" = 1 ] || warn "claimed $slice - other alias ranges on nic0 (if any) were replaced"
+  fi
+
+  # -- DNS zone --
+  local dnsproj=${CT_DNS_PROJECT:-$project}
+  if gcloud dns managed-zones describe "$CT_GCP_DNS_ZONE_NAME" --project "$dnsproj" >/dev/null 2>&1; then
+    init_status "DNS zone $CT_GCP_DNS_ZONE_NAME @ $dnsproj" "ok"
+  else
+    init_status "DNS zone $CT_GCP_DNS_ZONE_NAME ($CT_DNS_DOMAIN) @ $dnsproj" "CREATE (private)"
+    run gcloud dns managed-zones create "$CT_GCP_DNS_ZONE_NAME" --project "$dnsproj" \
+      --dns-name "$CT_DNS_DOMAIN." --description "ct containers" \
+      --visibility private --networks default
+  fi
+
+  # -- Cloud NAT coverage (report only) --
+  local routers
+  routers=$(gcloud compute routers list --project "$project" --regions "$region" --format="value(name)" 2>/dev/null || true)
+  if [ -n "$routers" ]; then
+    local r natinfo covered=0
+    for r in $routers; do
+      natinfo=$(gcloud compute routers nats list --router "$r" --region "$region" --project "$project" \
+        --format="value(name,sourceSubnetworkIpRangesToNat)" 2>/dev/null || true)
+      echo "$natinfo" | grep -qE 'ALL_SUBNETWORKS_ALL_IP_RANGES|ALL_SUBNETWORKS_ALL_PRIMARY_IP_RANGES' && covered=1
+      [ -n "$natinfo" ] && init_status "NAT on router $r" "$natinfo"
+    done
+    [ "$covered" = 1 ] && init_status "Cloud NAT covers secondary ranges" "ok (ALL ranges mode)" \
+      || warn "verify Cloud NAT includes the 'containers' secondary range (CT egress needs it)"
+  else
+    warn "no Cloud Router in $region - CT egress requires Cloud NAT covering the containers range"
+  fi
+
+  info "gcp-init done$( [ "$check" = 1 ] && echo " (check only)" )"
+}
+
+# ---------------------------------------------------------------------------
+# doctor  (read-only host health; exit 0 ok / 1 warns / 2 fails)
+# ---------------------------------------------------------------------------
+DOC_WARN=0; DOC_FAIL=0
+ok()      { printf "  OK    %s\n" "$*"; }
+dwarn()   { printf "  WARN  %s\n" "$*"; DOC_WARN=1; }
+dfail()   { printf "  FAIL  %s\n" "$*"; DOC_FAIL=1; }
+
+cmd_doctor() {
+  [ "${1:-}" = -h ] || [ "${1:-}" = --help ] && { usage_doctor; return 0; }
+  echo "=== ct doctor: $(hostname -s) ($(host_cores) cores, $(host_mem_h) RAM) ==="
+
+  local p
+  for p in lxc-start lxc-attach lxc-info debootstrap btrfs nft curl git; do
+    command -v "$p" >/dev/null 2>&1 && ok "$p" || dfail "$p missing"
+  done
+  command -v gcloud >/dev/null 2>&1 && ok "gcloud" || dwarn "gcloud missing (DNS/gcp-init unavailable)"
+
+  local fstype usepct
+  fstype=$(findmnt -n -o FSTYPE --target "$CT_LXC_DIR" 2>/dev/null || true)
+  [ "$fstype" = btrfs ] && ok "$CT_LXC_DIR on btrfs ($(lxc_backing_dev))" || dfail "$CT_LXC_DIR not btrfs (${fstype:-unmounted})"
+  usepct=$(df --output=pcent "$CT_LXC_DIR" 2>/dev/null | tail -1 | tr -dc 0-9)
+  if [ -n "$usepct" ]; then
+    [ "$usepct" -le 90 ] && ok "disk ${usepct}% used" || dwarn "disk ${usepct}% used (create refuses >90%)"
+  fi
+
+  [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" = 1 ] && ok "ip_forward=1" || dfail "ip_forward != 1"
+  [ "$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)" = 2 ] && ok "rp_filter=2" || dwarn "rp_filter != 2"
+  ip link show "$CT_LINK_IF" >/dev/null 2>&1 && ok "link $CT_LINK_IF present" || dfail "CT_LINK_IF $CT_LINK_IF missing"
+
+  grep -q '^root:' /etc/subuid 2>/dev/null && grep -q '^root:' /etc/subgid 2>/dev/null \
+    && ok "subuid/subgid root entries" || dfail "subuid/subgid root entries missing (ct init)"
+  grep -rq ct_authorized_keys /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null \
+    && ok "sshd ct Match block" || dwarn "sshd ct Match block missing (ct init)"
+  [ -s /etc/ssh/ct_authorized_keys ] && ok "ct_authorized_keys has key(s)" || dwarn "ct_authorized_keys empty (ssh ctN@host will not work)"
+  [ -f /etc/sudoers.d/ctadmin ] && ok "sudoers ctadmin" || dwarn "sudoers ctadmin missing (ct init)"
+  systemctl is-enabled lxc-net >/dev/null 2>&1 && dwarn "lxc-net enabled (should be masked)" || ok "lxc-net not enabled"
+  systemctl is-enabled nftables >/dev/null 2>&1 && ok "nftables enabled" || dwarn "nftables not enabled"
+  [ -f /etc/systemd/system/ct@.service ] && ok "ct@.service installed" || dfail "ct@.service missing (ct init)"
+  [ -f /etc/bash_completion.d/ct ] && ok "bash completion installed" || dwarn "bash completion missing (ct init)"
+
+  # GCE / GCP
+  local aliases zone
+  zone=$(metadata instance/zone)
+  if [ -n "$zone" ]; then
+    ok "GCE metadata reachable (${zone##*/})"
+    aliases=$(metadata "instance/network-interfaces/0/ip-aliases/?recursive=true")
+    if [ -n "$aliases" ]; then
+      echo "$aliases" | grep -q "$CT_IP_BASE" && ok "alias range matches CT_IP_BASE ($aliases)" \
+        || dwarn "alias range ($aliases) does not contain CT_IP_BASE=$CT_IP_BASE - IPs may not route"
+    else
+      dfail "no alias IP range on nic0 (ct gcp-init)"
+    fi
+  else
+    dwarn "GCE metadata unreachable (not on GCE?)"
+  fi
+  if [ -n "$CT_DNS_PROJECT" ] && command -v gcloud >/dev/null 2>&1; then
+    [ -n "$CT_GCLOUD_KEY_FILE" ] && export CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE="$CT_GCLOUD_KEY_FILE"
+    if timeout 15 gcloud dns managed-zones describe "$CT_GCP_DNS_ZONE_NAME" --project "$CT_DNS_PROJECT" >/dev/null 2>&1; then
+      ok "DNS zone $CT_GCP_DNS_ZONE_NAME reachable @ $CT_DNS_PROJECT"
+    else
+      dwarn "DNS zone $CT_GCP_DNS_ZONE_NAME not reachable @ $CT_DNS_PROJECT (perms? zone missing?)"
+    fi
+  else
+    dwarn "DNS disabled (CT_DNS_PROJECT empty or gcloud missing)"
+  fi
+
+  # per-CT
+  local ct state unit
+  for ct in $(ct_all); do
+    state=$(lxc-info -n "$ct" -s 2>/dev/null | awk '{print $2}'); state=${state:-STOPPED}
+    unit=$(unit_of "$ct")
+    if systemctl is-enabled "$unit.service" >/dev/null 2>&1; then
+      [ -f "$CT_LXC_DIR/$ct/ct.conf" ] && ok "$ct: $state, $unit enabled" \
+        || dwarn "$ct: $state, no ct.conf (pre-refactor CT - recreate or stamp)"
+    else
+      dwarn "$ct: $state, $unit.service not enabled"
+    fi
+  done
+
+  [ "$DOC_FAIL" = 1 ] && { echo "RESULT: FAIL"; return 2; }
+  [ "$DOC_WARN" = 1 ] && { echo "RESULT: WARN"; return 1; }
+  echo "RESULT: OK"
+}
+
+# ---------------------------------------------------------------------------
+# completion
+# ---------------------------------------------------------------------------
+cmd_completion() { payload_completion; }
+
+# ---------------------------------------------------------------------------
+# Payloads (written by ct init)
+# ---------------------------------------------------------------------------
+payload_conf() {
+  case "$1" in
+    defaults.conf) cat <<'EOF'
+# /etc/ct/defaults.conf - global config for the `ct` tool.
+# Sourced over built-in defaults; <role>.conf (via --config) layers on top;
+# CLI flags win over everything.
+
+# --- host layout ---
+#CT_LXC_DIR=/var/lib/lxc
+#CT_LINK_IF=ens4               # host NIC for ipvlan l3s (check: ip -o link)
+CT_IP_BASE=10.130.0.0          # this host's slice base; ctN = base + N
+CT_SLICE_SIZE=32               # 32 -> /27 -> ct1..ct31 (must match GCE alias range)
+#CT_IDMAP_START=231072
+#CT_IDMAP_SIZE=65536
+#CT_SSH_UID=1005
+#CT_SSH_GID=1005
+
+# --- container build ---
+CT_CODENAME=trixie
+CT_MIRROR=http://deb.debian.org/debian
+CT_PACKAGES=systemd,systemd-sysv,systemd-timesyncd,iputils-ping,nano,net-tools,less,lrzsz,rsync,procps,wget,curl,locales,tzdata,iproute2,bash-completion
+CT_TZ=America/Los_Angeles
+CT_TEMPLATE=                   # subvolume dir, tarball, or name in CT_TEMPLATE_DIR; empty = debootstrap
+#CT_TEMPLATE_DIR=/var/lib/lxc/.templates
+#CT_SNAP_DIR=/var/lib/lxc/.snapshots
+#CT_SNAP_KEEP=7
+
+# --- resource defaults (see `ct help set`; empty = no limit) ---
+CT_MEM_MAX=512M                # hard cap; OOM-kill inside CT above this
+CT_MEM_HIGH=448M               # throttle line; reclaim+slow, no kill
+#CT_MEM_PROTECT=               # MemoryLow - soft protection from host pressure
+#CT_MEM_RESERVE=               # MemoryMin - HARD reservation, subtracts from others
+#CT_CPU_MAX=                   # decimal cores ceiling, e.g. 1.5 (not a reservation)
+CT_CPU_WEIGHT=100              # 1..10000; only matters when host CPU is saturated
+#CT_CPU_PIN=                   # e.g. 0-3; empty = all cores (recommended)
+#CT_IO_READ_MAX=               # bytes/sec, e.g. 50M
+#CT_IO_WRITE_MAX=
+#CT_IO_READ_IOPS=
+#CT_IO_WRITE_IOPS=
+CT_TASKS_MAX=2048              # max processes/threads (fork-bomb fence)
+
+# --- hooks ---
+#CT_HOOK_SCRIPTS_DIR=/etc/ct/scripts
+CT_HOOKS_CHROOT=()             # run via chroot before first start: ("script.sh args")
+CT_HOOKS_ATTACH=()             # run via lxc-attach after RUNNING
+CT_HOOKS_REPO_URL=https://github.com/tacticallinux/repo-scripts.git
+
+# --- GCP / DNS (CT_DNS_PROJECT empty = no DNS operations) ---
+CT_GCP_PROJECT=                # compute project; empty = detect from metadata
+CT_DNS_PROJECT=                # project hosting the DNS zones (may differ from above)
+CT_GCP_DNS_ZONE_NAME=dev-lan
+CT_DNS_DOMAIN=dev.lan
+#CT_DNS_TTL=300
+CT_GCLOUD_KEY_FILE=            # SA key JSON; empty = VM service account (recommended)
+
+CT_ALIAS=                      # per-instance alias; normally set via --alias
+EOF
+      ;;
+    mqtt.conf) cat <<'EOF'
+# /etc/ct/mqtt.conf - MQTT node profile (use: ct create --config mqtt)
+CT_PACKAGES=systemd,systemd-sysv,systemd-timesyncd,iputils-ping,nano,net-tools,less,lrzsz,rsync,procps,wget,curl,locales,tzdata,iproute2,bash-completion,mosquitto,mosquitto-clients
+
+CT_HOOKS_ATTACH=(
+"base.sh"
+"nginx-repo.sh --install"
+"php-repo.sh --install"
+)
+EOF
+      ;;
+    *) die "unknown payload: $1" ;;
+  esac
+}
+
+payload_unit() {
+  cat <<EOF
+# /etc/systemd/system/ct@.service - one template for all CTs (installed by ct init)
+# Instance = container number: 'systemctl start ct@2' runs container ct2.
+# Per-CT resource overrides: /etc/systemd/system/ct@N.service.d/50-resources.conf
+# (written by 'ct create' / 'ct set' - only non-default knobs appear there).
+#
+# Knobs below marked [knob] are the ones the ct tool manages. Values here are
+# fleet-wide defaults. Empty assignment = systemd default / no limit.
+# NOTE: all limits are CEILINGS or contention priorities - nothing reserves or
+# dedicates resources to a CT (except AllowedCPUs pinning, discouraged).
+
+[Unit]
+Description=LXC container ct%i
+After=lxc.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lxc-start -F -n ct%i
+ExecStop=/usr/bin/lxc-stop -n ct%i
+KillMode=mixed
+TimeoutStopSec=60
+Restart=always
+RestartSec=2
+Delegate=yes
+OOMPolicy=continue
+MemorySwapMax=0
+
+# --- memory [knobs] ---
+MemoryMax=$TPL_MEM_MAX
+MemoryHigh=$TPL_MEM_HIGH
+MemoryLow=
+MemoryMin=
+
+# --- cpu [knobs] (CPUQuota: 100% = 1 core; CPUWeight: 1..10000, contention only) ---
+CPUQuota=
+CPUWeight=$TPL_CPU_WEIGHT
+AllowedCPUs=
+
+# --- io [knobs] (per-device: 'ct set' fills in the /var/lib/lxc backing device) ---
+IOReadBandwidthMax=
+IOWriteBandwidthMax=
+IOReadIOPSMax=
+IOWriteIOPSMax=
+
+# --- tasks [knob] ---
+TasksMax=$TPL_TASKS_MAX
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+payload_base_sh() {
+  cat <<'BASE_SH_PAYLOAD'
+#!/bin/bash
+# base.sh - baseline CT setup hook (runs INSIDE the CT via chroot or lxc-attach).
+# Also serves as the example hook script; pull more with: ct hooks pull
+
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export DEBIAN_PRIORITY=critical
+
+cat > /etc/apt/apt.conf.d/99-no-recommends <<'EOF'
+APT::Install-Recommends "false";
+APT::Install-Suggests "false";
+EOF
+
+cat > /etc/sysctl.d/99-disable-ipv6.conf <<'EOF'
+# Disable IPv6 on all interfaces
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+
+# Generate only UTF-8 locale
+cat > /etc/locale.gen <<'EOF'
+en_US.UTF-8 UTF-8
+EOF
+
+locale-gen
+
+# Set default locale
+cat > /etc/default/locale <<'EOF'
+LANG=en_US.UTF-8
+LC_ALL=en_US.UTF-8
+EOF
+
+update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# Create profile script for all users
+cat > /etc/profile.d/custom-aliases.sh <<'EOF'
+# Custom aliases for all users
+alias ls='ls -a'
+alias p='nano -L -O -S -T 2 -c -w -x -Y none'
+alias xx='exit'
+
+# Environment variables
+export S_COLORS=never
+export SYSTEMD_PAGER=
+EOF
+
+chmod 644 /etc/profile.d/custom-aliases.sh
+
+# Also add to /etc/bash.bashrc for interactive non-login shells
+if ! grep -q "custom-aliases.sh" /etc/bash.bashrc 2>/dev/null; then
+    cat >> /etc/bash.bashrc <<'EOF'
+
+# Source custom aliases if not already loaded
+if [ -f /etc/profile.d/custom-aliases.sh ]; then
+    . /etc/profile.d/custom-aliases.sh
+fi
+EOF
+fi
+BASE_SH_PAYLOAD
+}
+
+payload_completion() {
+  cat <<'EOF'
+# bash completion for ct (generated by 'ct completion')
+_ct_cts()   { ls -d /var/lib/lxc/ct[0-9]* 2>/dev/null | xargs -rn1 basename; }
+_ct_roles() { ls /etc/ct/*.conf 2>/dev/null | xargs -rn1 basename | sed 's/\.conf$//' | grep -v '^defaults$'; }
+
+_ct() {
+  local cur prev cmd
+  COMPREPLY=()
+  cur=${COMP_WORDS[COMP_CWORD]}
+  prev=${COMP_WORDS[COMP_CWORD-1]}
+  cmd=""
+  local i
+  for ((i=1; i<COMP_CWORD; i++)); do
+    case "${COMP_WORDS[i]}" in
+      -n|--dry-run|-q|--quiet) ;;
+      *) cmd=${COMP_WORDS[i]}; break ;;
+    esac
+  done
+
+  local res_flags="--mem-max --mem-high --mem-protect --mem-reserve --cpu-max --cpu-weight --cpu-pin --io-read-max --io-write-max --io-read-iops --io-write-iops --tasks-max"
+
+  if [ -z "$cmd" ]; then
+    COMPREPLY=($(compgen -W "create destroy attach exec list info start stop restart set snap template init gcp-init doctor hooks completion help -n --dry-run -q --quiet" -- "$cur"))
+    return
+  fi
+
+  case "$cmd" in
+    create)
+      case "$prev" in
+        --config)   COMPREPLY=($(compgen -W "$(_ct_roles)" -- "$cur")); return ;;
+        --template) COMPREPLY=($(compgen -f -- "$cur")); return ;;
+      esac
+      COMPREPLY=($(compgen -W "--name --config --alias --template --no-dns $res_flags" -- "$cur")) ;;
+    destroy) COMPREPLY=($(compgen -W "$(_ct_cts) --yes --force --purge --keep-dns" -- "$cur")) ;;
+    attach|info) COMPREPLY=($(compgen -W "$(_ct_cts)" -- "$cur")) ;;
+    exec) COMPREPLY=($(compgen -W "$(_ct_cts) --" -- "$cur")) ;;
+    list) COMPREPLY=($(compgen -W "--running --stopped" -- "$cur")) ;;
+    start|stop|restart) COMPREPLY=($(compgen -W "$(_ct_cts) --all" -- "$cur")) ;;
+    set) COMPREPLY=($(compgen -W "$(_ct_cts) --alias --live $res_flags" -- "$cur")) ;;
+    init) COMPREPLY=($(compgen -W "--check --force" -- "$cur")) ;;
+    gcp-init) COMPREPLY=($(compgen -W "--check" -- "$cur")) ;;
+    hooks) COMPREPLY=($(compgen -W "list pull" -- "$cur")) ;;
+    help) COMPREPLY=($(compgen -W "create destroy attach exec list info start stop restart set init gcp-init doctor hooks completion" -- "$cur")) ;;
+  esac
+}
+complete -F _ct ct
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# usage / help
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+ct $CT_VERSION - LXC container host tool (GCE/GCP)
+
+Usage: ct [-n|--dry-run] [-q|--quiet] <command> [args]
+
+Containers:
+  create   [--name ctN] [--config <role>] [--alias <name>] [--template <t>] [resource flags]
+  destroy  <ctN> --yes [--force] [--purge] [--keep-dns]
+  attach   <ctN>                    root shell inside the CT
+  exec     <ctN> -- <cmd...>        run one command inside the CT
+  list     [--running|--stopped]
+  info     <ctN>
+  start|stop|restart <ctN>... | --all
+  set      <ctN> [resource flags] [--alias <name>] [--live]
+
+Host / GCP:
+  init     [--check] [--force]      bootstrap this host (configs, unit, deps, sshd, nftables)
+  gcp-init [--check]                bootstrap the GCP side (secondary range, alias slice, DNS)
+  doctor                            host + CT health report
+  hooks    list | pull [name...]    manage hook scripts from CT_HOOKS_REPO_URL
+  completion                        emit bash completion script
+
+Resource flags (all are ceilings/priorities, NOT reservations - 'ct help set'):
+  --mem-max --mem-high --mem-protect --mem-reserve      (bytes: 512M, 1G)
+  --cpu-max (decimal cores, e.g 1.5)  --cpu-weight (1-10000)  --cpu-pin (e.g 0-3)
+  --io-read-max --io-write-max (bytes/s)  --io-read-iops --io-write-iops
+  --tasks-max (processes/threads)
+
+This host: $(host_cores) cores, $(host_mem_h) RAM. 'ct help <command>' for details.
+EOF
+}
+
+usage_create() {
+  cat <<EOF
+ct create - provision a new container (auto-picks lowest free N)
+
+  ct create [--name ctN] [--config <role>] [--alias <name>] [--template <t>]
+            [--no-dns] [resource flags]
+
+  --name ctN        explicit name/slot (default: lowest free; N=1..$(ct_max))
+  --config <role>   layer $CONFDIR/<role>.conf over defaults (e.g. mqtt)
+  --alias <name>    instance alias -> CNAME <name>.$CT_DNS_DOMAIN + prompt tag
+  --template <t>    subvolume dir, tarball, or name in $CT_TEMPLATE_DIR
+  --no-dns          skip DNS record updates
+$(usage_resflags)
+EOF
+}
+
+usage_destroy() {
+  cat <<'EOF'
+ct destroy - remove a container
+
+  ct destroy <ctN> --yes [--force] [--purge] [--keep-dns]
+
+  --yes       required confirmation
+  --force     stop first if running
+  --purge     also remove resource drop-in + host ssh user (default keeps both)
+  --keep-dns  keep the alias CNAME record
+EOF
+}
+
+usage_attach() { echo "ct attach <ctN> - root login shell inside the CT (lxc-attach)"; }
+usage_exec()   { echo "ct exec <ctN> -- <cmd...> - run a command inside the CT"; }
+usage_list()   { echo "ct list [--running|--stopped] - one line per container"; }
+usage_info()   { echo "ct info <ctN> - full detail: state, config, resources, unit"; }
+
+usage_set() {
+  cat <<EOF
+ct set - change a container's resources or alias
+
+  ct set <ctN> [resource flags] [--alias <name>] [--live]
+
+  --live    also apply cgroup limits to the running CT now (IO limits still
+            need a restart); without it, changes apply on next restart
+$(usage_resflags)
+EOF
+}
+
+usage_resflags() {
+  cat <<EOF
+
+  Resource flags - every limit is a CEILING or a contention priority; nothing
+  here dedicates/reserves resources for a CT except --cpu-pin (and --mem-reserve).
+  This host: $(host_cores) cores, $(host_mem_h) RAM.
+
+  --mem-max <b>      hard cap (OOM-kill above). range 0..$(host_mem_h)   [default 512M]
+  --mem-high <b>     throttle line (reclaim+slow, no kill)  [default 448M]
+  --mem-protect <b>  soft protection from host memory pressure (MemoryLow)
+  --mem-reserve <b>  HARD reservation (MemoryMin) - subtracts from all other CTs;
+                     keep the sum across CTs well under $(host_mem_h)
+  --cpu-max <cores>  decimal-core ceiling, 0..$(host_cores) (e.g. 1.5 = never more than
+                     1.5 cores, even when the host is idle; NOT dedicated cores)
+  --cpu-weight <n>   1..10000, default 100. Only matters when host CPU is
+                     saturated: CPU splits proportionally among busy CTs
+  --cpu-pin <list>   pin to cores, e.g. 0-3 or 0,2 (host: 0-$(( $(host_cores) - 1 ))). Discouraged
+  --io-read-max <b>/s  --io-write-max <b>/s   throughput ceilings on $(lxc_backing_dev)
+  --io-read-iops <n>   --io-write-iops <n>    IOPS ceilings
+  --tasks-max <n>    max processes/threads    [default 2048]
+
+  <b> = bytes with K/M/G/T suffix, e.g. 512M, 2G
+EOF
+}
+
+usage_init() {
+  cat <<'EOF'
+ct init - bootstrap this host as an LXC container host (idempotent)
+
+  ct init [--check] [--force]
+
+  Installs packages (lxc, debootstrap, btrfs-progs, nftables), masks lxc-net +
+  systemd-ssh-generator, sets sysctls, subuid/subgid, ssh console access
+  (users/sshd/sudoers), nftables scaffold, writes /etc/ct configs + ct@.service
+  + bash completion, installs itself to /usr/local/sbin/ct.
+
+  --check   report what would be done, change nothing
+  --force   overwrite existing /etc/ct payload files with built-in versions
+EOF
+}
+
+usage_gcp_init() {
+  cat <<'EOF'
+ct gcp-init - bootstrap the GCP project side (requires gcloud)
+
+  ct gcp-init [--check]
+
+  Ensures: subnet secondary range 'containers', this instance's alias IP slice
+  (CT_IP_BASE/CT_SLICE_SIZE, conflict-checked), private DNS zone, and reports
+  Cloud NAT coverage. --check reports without changing anything.
+EOF
+}
+
+usage_doctor() { echo "ct doctor - read-only health report (exit 0 ok / 1 warns / 2 fails)"; }
+
+usage_hooks() {
+  cat <<'EOF'
+ct hooks - manage CT hook scripts (fetched from CT_HOOKS_REPO_URL)
+
+  ct hooks list           local + remote hook scripts
+  ct hooks pull [name...] fetch all (or named) *.sh into /etc/ct/scripts
+EOF
+}
+
+cmd_help() {
+  case "${1:-}" in
+    create) usage_create ;; destroy) usage_destroy ;; attach) usage_attach ;;
+    exec) usage_exec ;; list) usage_list ;; info) usage_info ;;
+    set) usage_set ;; init) usage_init ;; gcp-init) usage_gcp_init ;;
+    doctor) usage_doctor ;; hooks) usage_hooks ;;
+    start|stop|restart) echo "ct ${1} <ctN> [ctN...] | --all" ;;
+    completion) echo "ct completion - emit bash completion (install: ct completion > /etc/bash_completion.d/ct)" ;;
+    *) usage ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+main() {
+  # global flags before the subcommand
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--dry-run) DRYRUN=1; shift ;;
+      -q|--quiet)   QUIET=1; shift ;;
+      -h|--help)    usage; return 0 ;;
+      --version)    echo "ct $CT_VERSION"; return 0 ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || { usage; return 1; }
+  local cmd=$1; shift
+
+  load_defaults
+
+  case "$cmd" in
+    create)   cmd_create "$@" ;;
+    destroy)  cmd_destroy "$@" ;;
+    attach)   cmd_attach "$@" ;;
+    exec)     cmd_exec "$@" ;;
+    list|ls)  cmd_list "$@" ;;
+    info)     cmd_info "$@" ;;
+    start)    cmd_start "$@" ;;
+    stop)     cmd_stop "$@" ;;
+    restart)  cmd_restart "$@" ;;
+    set)      cmd_set "$@" ;;
+    init)     cmd_init "$@" ;;
+    gcp-init) cmd_gcp_init "$@" ;;
+    doctor)   cmd_doctor "$@" ;;
+    hooks)    cmd_hooks "$@" ;;
+    completion) cmd_completion "$@" ;;
+    help)     cmd_help "$@" ;;
+    *) die "unknown command: $cmd (try: ct help)" ;;
+  esac
+}
+
+main "$@"
