@@ -122,8 +122,14 @@ Subcommand CLI, bash, shellcheck-clean, `ct help <cmd>` for details:
 - create/destroy/attach/exec/list/info/start/stop/restart/set - container ops.
   create auto-picks lowest free N; IP = CT_IP_BASE + N; config layering:
   built-in -> /etc/ct/defaults.conf -> /etc/ct/<role>.conf (--config) -> CLI
-  flags (CLI resource flags win over role configs). destroy: --yes required,
-  --force to stop running, --purge removes drop-in + ssh user, --keep-dns
+  flags (CLI resource flags win over role configs). LAYERING RULE: scalars
+  REPLACE across layers; list vars CT_REPOS/CT_INSTALL/CT_HOOKS_CHROOT/
+  CT_HOOKS_ATTACH ACCUMULATE (defaults' entries first, then role's - so
+  defaults' base.sh runs on every CT and role confs are pure deltas).
+  Create order: debootstrap(CT_PACKAGES, defaults-only var = sane Debian
+  base) -> CT_REPOS ("<script> --install" each) -> apt-get install
+  CT_INSTALL -> CT_HOOKS_ATTACH. destroy: --yes required, --force to stop
+  running, --purge removes drop-in + ssh user, --keep-dns
 - set: rewrites the resource drop-in + ct.conf; --live applies cgroup knobs
   to the running CT via set-property (IO knobs need restart)
 - init: idempotent host bootstrap (packages, masks, sysctls, subuid, sshd
@@ -203,9 +209,9 @@ All of the below is what init does/checks - on a new host: curl the ct script,
 7. gce-create script exists (separate, from earlier sessions) for VM
    provisioning; ct's config layering modeled on its defaults+named-config
    pattern
-8. **mqtt.conf hook list needs Diane's review**: CT_HOOKS_ATTACH runs
-   nginx-repo.sh + php-repo.sh --install - looks copy-pasted from a web
-   profile; an MQTT node likely wants mosquitto-repo.sh instead
+8. (resolved) mqtt.conf's nginx/php hooks were Diane's hook TESTS; now a pure
+   delta: CT_REPOS=(mosquitto-repo.sh) + CT_INSTALL="mosquitto
+   mosquitto-clients" (mainline broker from mosquitto.org, not Debian's)
 
 ## Conventions / gotchas learned
 - nftables: 'fwd' is a reserved keyword (chain name ctfwd); [0-9] globs work

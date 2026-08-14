@@ -53,7 +53,12 @@ CT_IO_READ_IOPS=
 CT_IO_WRITE_IOPS=
 CT_TASKS_MAX=2048
 
-# Hooks
+# Repos / extra packages / hooks.
+# LAYERING RULE: scalar vars REPLACE across config layers; the list vars
+# CT_REPOS / CT_INSTALL / CT_HOOKS_CHROOT / CT_HOOKS_ATTACH ACCUMULATE:
+# defaults.conf entries run first, then the role conf's entries.
+CT_REPOS=()                     # repo hooks, run "<script> --install" before CT_INSTALL
+CT_INSTALL=""                   # extra packages installed after repos (space-separated)
 CT_HOOK_SCRIPTS_DIR=/etc/ct/scripts
 CT_HOOKS_CHROOT=()
 CT_HOOKS_ATTACH=()
@@ -111,10 +116,20 @@ load_defaults() {
   return 0
 }
 
-load_role() {  # $1 = role name
+load_role() {  # $1 = role name; list vars accumulate (defaults first, then role)
   [ -f "$CONFDIR/$1.conf" ] || die "named config not found: $CONFDIR/$1.conf"
+  local d_repos=(${CT_REPOS[@]+"${CT_REPOS[@]}"})
+  local d_chroot=(${CT_HOOKS_CHROOT[@]+"${CT_HOOKS_CHROOT[@]}"})
+  local d_attach=(${CT_HOOKS_ATTACH[@]+"${CT_HOOKS_ATTACH[@]}"})
+  local d_install=$CT_INSTALL
+  CT_REPOS=(); CT_HOOKS_CHROOT=(); CT_HOOKS_ATTACH=(); CT_INSTALL=""
   # shellcheck disable=SC1090
   . "$CONFDIR/$1.conf"
+  CT_REPOS=(${d_repos[@]+"${d_repos[@]}"} ${CT_REPOS[@]+"${CT_REPOS[@]}"})
+  CT_HOOKS_CHROOT=(${d_chroot[@]+"${d_chroot[@]}"} ${CT_HOOKS_CHROOT[@]+"${CT_HOOKS_CHROOT[@]}"})
+  CT_HOOKS_ATTACH=(${d_attach[@]+"${d_attach[@]}"} ${CT_HOOKS_ATTACH[@]+"${CT_HOOKS_ATTACH[@]}"})
+  CT_INSTALL="$d_install $CT_INSTALL"
+  CT_INSTALL="${CT_INSTALL# }"; CT_INSTALL="${CT_INSTALL% }"
 }
 
 # --- host facts -------------------------------------------------------------
@@ -400,9 +415,9 @@ cmd_create() {
       || die "template not found: $CT_TEMPLATE"
   fi
 
-  # hook validation
+  # hook validation (repo hooks included)
   local entry src
-  for entry in ${CT_HOOKS_CHROOT[@]+"${CT_HOOKS_CHROOT[@]}"} ${CT_HOOKS_ATTACH[@]+"${CT_HOOKS_ATTACH[@]}"}; do
+  for entry in ${CT_REPOS[@]+"${CT_REPOS[@]}"} ${CT_HOOKS_CHROOT[@]+"${CT_HOOKS_CHROOT[@]}"} ${CT_HOOKS_ATTACH[@]+"${CT_HOOKS_ATTACH[@]}"}; do
     # shellcheck disable=SC2086
     eval set -- $entry
     src=$(resolve_hook "$1")
@@ -443,8 +458,10 @@ Rootfs:     $rootfs $( [ -n "$CT_TEMPLATE" ] && echo "(from template: $CT_TEMPLA
 Unit:       $(unit_of "$ct").service (+ resource drop-in if non-default)
 Mem:        Max=$R_MEM_MAX High=$R_MEM_HIGH${R_MEM_PROTECT:+ Protect=$R_MEM_PROTECT}${R_MEM_RESERVE:+ Reserve=$R_MEM_RESERVE}
 CPU:        ${R_CPU_MAX:+Max=${R_CPU_MAX}cores }Weight=$R_CPU_WEIGHT${R_CPU_PIN:+ Pin=$R_CPU_PIN}  Tasks: $R_TASKS_MAX
+Repos:      ${CT_REPOS[*]:-<none>}
+Install:    ${CT_INSTALL:-<none>}
 Hooks:      chroot=${CT_HOOKS_CHROOT[*]:-<none>} | attach=${CT_HOOKS_ATTACH[*]:-<none>}
-Configs:    built-in + defaults${role:+ + $role.conf}
+Configs:    built-in + defaults${role:+ + $role.conf} (lists accumulate: defaults then role)
 ======================
 EOF
 
@@ -526,10 +543,10 @@ ln -sf /lib/systemd/system/poweroff.target /etc/systemd/system/reboot.target
 EOSH
   fi
 
-  # ---- copy hook scripts into CT ----
-  if [ "${#CT_HOOKS_CHROOT[@]}" -gt 0 ] || [ "${#CT_HOOKS_ATTACH[@]}" -gt 0 ]; then
+  # ---- copy hook + repo scripts into CT ----
+  if [ "${#CT_REPOS[@]}" -gt 0 ] || [ "${#CT_HOOKS_CHROOT[@]}" -gt 0 ] || [ "${#CT_HOOKS_ATTACH[@]}" -gt 0 ]; then
     mkdir -p "$rootfs$CT_SCRIPTS_TARGET"
-    for entry in ${CT_HOOKS_CHROOT[@]+"${CT_HOOKS_CHROOT[@]}"} ${CT_HOOKS_ATTACH[@]+"${CT_HOOKS_ATTACH[@]}"}; do
+    for entry in ${CT_REPOS[@]+"${CT_REPOS[@]}"} ${CT_HOOKS_CHROOT[@]+"${CT_HOOKS_CHROOT[@]}"} ${CT_HOOKS_ATTACH[@]+"${CT_HOOKS_ATTACH[@]}"}; do
       # shellcheck disable=SC2086
       eval set -- $entry
       src=$(resolve_hook "$1")
@@ -611,9 +628,29 @@ EOF
   done
   [ "$up" = 1 ] || die "$ct failed to reach RUNNING within 30s - check: journalctl -u $(unit_of "$ct") ; lxc-start -n $ct -F -l DEBUG -o /tmp/$ct.log"
 
-  # ---- attach hooks ----
-  if [ "${#CT_HOOKS_ATTACH[@]}" -gt 0 ]; then
+  # ---- repos -> install -> attach hooks (fixed order) ----
+  if [ "${#CT_REPOS[@]}" -gt 0 ] || [ -n "$CT_INSTALL" ] || [ "${#CT_HOOKS_ATTACH[@]}" -gt 0 ]; then
     sleep 2
+  fi
+  if [ "${#CT_REPOS[@]}" -gt 0 ]; then
+    for entry in "${CT_REPOS[@]}"; do
+      # shellcheck disable=SC2086
+      eval set -- $entry
+      local rs
+      rs="$CT_SCRIPTS_TARGET/$(basename "$1")"
+      info "adding repo: $rs --install"
+      lxc-attach -n "$ct" --clear-env -- "$rs" --install
+    done
+  fi
+  if [ -n "$CT_INSTALL" ]; then
+    info "installing role packages: $CT_INSTALL"
+    lxc-attach -n "$ct" --clear-env -v DEBIAN_FRONTEND=noninteractive \
+      -- apt-get update -qq
+    # shellcheck disable=SC2086
+    lxc-attach -n "$ct" --clear-env -v DEBIAN_FRONTEND=noninteractive \
+      -- apt-get install -y -qq $CT_INSTALL
+  fi
+  if [ "${#CT_HOOKS_ATTACH[@]}" -gt 0 ]; then
     for entry in "${CT_HOOKS_ATTACH[@]}"; do
       # shellcheck disable=SC2086
       eval set -- $entry
@@ -1358,8 +1395,13 @@ CT_SLICE_SIZE=32               # 32 -> /27 -> ct1..ct31 (must match GCE alias ra
 #CT_SSH_GID=1005
 
 # --- container build ---
+# LAYERING RULE: scalar vars REPLACE across layers (defaults -> role -> CLI);
+# the list vars CT_REPOS / CT_INSTALL / CT_HOOKS_CHROOT / CT_HOOKS_ATTACH
+# ACCUMULATE: entries here run first, then the role conf's entries.
+# Create order: debootstrap(CT_PACKAGES) -> CT_REPOS -> CT_INSTALL -> hooks.
 CT_CODENAME=trixie
 CT_MIRROR=http://deb.debian.org/debian
+# CT_PACKAGES is the debootstrap base - defaults-only; roles use CT_INSTALL
 CT_PACKAGES=systemd,systemd-sysv,systemd-timesyncd,iputils-ping,nano,net-tools,less,lrzsz,rsync,procps,wget,curl,locales,tzdata,iproute2,bash-completion
 CT_TZ=America/Los_Angeles
 CT_TEMPLATE=                   # subvolume dir, tarball, or name in CT_TEMPLATE_DIR; empty = debootstrap
@@ -1381,10 +1423,12 @@ CT_CPU_WEIGHT=100              # 1..10000; only matters when host CPU is saturat
 #CT_IO_WRITE_IOPS=
 CT_TASKS_MAX=2048              # max processes/threads (fork-bomb fence)
 
-# --- hooks ---
+# --- repos / role packages / hooks (ALL of these accumulate across layers) ---
+CT_REPOS=()                    # repo hooks, run first as "<script> --install"
+CT_INSTALL=""                  # packages installed after repos (space-separated)
 #CT_HOOK_SCRIPTS_DIR=/etc/ct/scripts
 CT_HOOKS_CHROOT=()             # run via chroot before first start: ("script.sh args")
-CT_HOOKS_ATTACH=()             # run via lxc-attach after RUNNING
+CT_HOOKS_ATTACH=( "base.sh" )  # every CT gets base.sh; roles append their own
 CT_HOOKS_REPO_URL=https://github.com/tacticallinux/repo-scripts.git
 
 # --- GCP / DNS (CT_DNS_PROJECT empty = no DNS operations) ---
@@ -1400,13 +1444,10 @@ EOF
       ;;
     mqtt.conf) cat <<'EOF'
 # /etc/ct/mqtt.conf - MQTT node profile (use: ct create --config mqtt)
-CT_PACKAGES=systemd,systemd-sysv,systemd-timesyncd,iputils-ping,nano,net-tools,less,lrzsz,rsync,procps,wget,curl,locales,tzdata,iproute2,bash-completion,mosquitto,mosquitto-clients
-
-CT_HOOKS_ATTACH=(
-"base.sh"
-"nginx-repo.sh --install"
-"php-repo.sh --install"
-)
+# Pure delta over defaults.conf: base packages/hooks come from defaults
+# (lists accumulate). Mainline broker from mosquitto.org, not Debian's.
+CT_REPOS=( "mosquitto-repo.sh" )
+CT_INSTALL="mosquitto mosquitto-clients"
 EOF
       ;;
     *) die "unknown payload: $1" ;;
@@ -1627,7 +1668,10 @@ ct create - provision a new container (auto-picks lowest free N)
             [--no-dns] [resource flags]
 
   --name ctN        explicit name/slot (default: lowest free; N=1..$(ct_max))
-  --config <role>   layer $CONFDIR/<role>.conf over defaults (e.g. mqtt)
+  --config <role>   layer $CONFDIR/<role>.conf over defaults (e.g. mqtt).
+                    Scalars replace; CT_REPOS/CT_INSTALL/CT_HOOKS_* accumulate
+                    (defaults' entries first). Order: debootstrap -> repos ->
+                    install -> attach hooks
   --alias <name>    instance alias -> CNAME <name>.$CT_DNS_DOMAIN + prompt tag
   --template <t>    subvolume dir, tarball, or name in $CT_TEMPLATE_DIR
   --no-dns          skip DNS record updates
