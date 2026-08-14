@@ -175,12 +175,19 @@ All of the below is what init does/checks - on a new host: curl the ct script,
    CT_SNAP_DIR=/var/lib/lxc/.snapshots/<ct>-<stamp>, retention prune
    (CT_SNAP_KEEP). Recovery: stop CT, mv rootfs aside, rw-snapshot from
    snapshot, start. Cadence TBD. (config keys + completion already reserved)
-2. **ct template** subcommand: snapshot existing CT rootfs ->
-   CT_TEMPLATE_DIR=.templates/<name> (rw) -> offline sysprep (truncate
-   machine-id, rm eth0.network/hosts line/ct-alias.sh/logs/apt cache/history;
-   KEEP bash_profile/reboot symlink/enables) -> btrfs property set ro true.
-   Templates independent of source CT (CoW; source deletable). Never boot
-   templates. (`ct create --template <name>` already resolves names there)
+2. (DONE) **ct template** bake/make/list/rm. Terminology: "CT template" =
+   baked sysprepped ro rootfs snapshot in CT_TEMPLATE_DIR=.templates/;
+   distinct from "role configs" (<role>.conf). `bake <name> [--config r]` =
+   fresh debootstrap temp CT (highest free slot, no DNS, BAKE_FRESH ignores
+   CT_TEMPLATE/CT_ALIAS) -> stop -> sysprep -> ro snapshot -> destroy temp.
+   Refresh policy (Diane): ALWAYS fresh debootstrap, never apt-upgrade an
+   old template. Existing name rotates to <name>.prev (one-deep rollback:
+   --template <name>.prev). `make <name> --from ctN` for hand-built CTs
+   (must be stopped). Sysprep strips: machine-id, eth0.network, hosts/
+   hostname, ct-alias.sh, logs/journal, apt cache+lists, histories,
+   random-seed, tmp; KEEPS enables/reboot symlink/bash_profile/dpkg state.
+   Never boot templates. Planned set: base, mqtt-base, web-base; role confs
+   reference via CT_TEMPLATE=<name>
 2b. **Log subvolume** (decided, not built): host subvol or per-CT for daemon
    logs, bind-mounted into CTs, EXCLUDED from ct snap; keep CoW+zstd (files
    die young via 3-day logrotate, fragmentation bounded); chown to CT's
@@ -214,6 +221,14 @@ All of the below is what init does/checks - on a new host: curl the ct script,
    mosquitto-clients" (mainline broker from mosquitto.org, not Debian's)
 
 ## Conventions / gotchas learned
+- Sysprep MUST also remove /var/lib/dbus/machine-id - systemd falls back to
+  it when /etc/machine-id is empty, silently cloning the source CT's identity
+  (bug found+fixed; create also rms it)
+- create now makes rootfs its OWN subvolume (inside the ctN subvolume) so
+  template make can snapshot it; legacy plain-dir rootfs handled via
+  cp --reflink=auto (=always fails on journald's NOCOW files)
+- t2d1 templates baked: base, base.prev, mqtt-base; mqtt.conf sets
+  CT_TEMPLATE=mqtt-base (mqtt create: ~13s vs ~7min debootstrap)
 - nftables: 'fwd' is a reserved keyword (chain name ctfwd); [0-9] globs work
   in sudoers but NOT sshd Match
 - debootstrap systemd-resolved --include fails; install in chroot after

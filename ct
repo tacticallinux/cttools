@@ -380,6 +380,9 @@ cmd_create() {
   fi
   [ -n "$alias_arg" ] && CT_ALIAS=$alias_arg
 
+  # bake mode (ct template bake): always fresh debootstrap, no baked-in alias
+  if [ "${BAKE_FRESH:-0}" = 1 ]; then CT_TEMPLATE=""; CT_ALIAS=""; fi
+
   # ---- validation ----
   local fstype usepct
   fstype=$(findmnt -n -o FSTYPE --target "$CT_LXC_DIR")
@@ -486,6 +489,12 @@ EOF
       esac
     fi
   else
+    # rootfs as its own subvolume so 'ct template make' can snapshot it
+    if [ "$DRYRUN" = 1 ]; then
+      echo "DRY: btrfs subvolume create $rootfs"
+    else
+      btrfs subvolume create "$rootfs" >/dev/null
+    fi
     info "running debootstrap ($CT_CODENAME)"
     run debootstrap --variant=minbase --include="$CT_PACKAGES" \
         "$CT_CODENAME" "$rootfs" "$CT_MIRROR"
@@ -574,6 +583,7 @@ EOSH
 
   ln -sf /run/systemd/resolve/stub-resolv.conf "$rootfs/etc/resolv.conf"
   truncate -s0 "$rootfs/etc/machine-id"
+  rm -f "$rootfs/var/lib/dbus/machine-id"   # fallback id source - must not survive
 
   # ---- LXC config ----
   cat > "$CT_LXC_DIR/$ct/config" <<EOF
@@ -934,6 +944,165 @@ EOF
     fi
     info "alias: ${old_alias:-<none>} -> $new_alias"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# template  (CT templates: baked, sysprepped, read-only rootfs snapshots)
+# ---------------------------------------------------------------------------
+cmd_template() {
+  local sub=${1:-}; shift || true
+  case "$sub" in
+    bake) tpl_bake "$@" ;;
+    make) tpl_make "$@" ;;
+    list) tpl_list "$@" ;;
+    rm)   tpl_rm "$@" ;;
+    *)    usage_template ;;
+  esac
+}
+
+tpl_name_ok() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid template name: $1"
+  case "$1" in *.prev) die "the '.prev' suffix is reserved for rotation" ;; esac
+}
+
+sysprep() {  # $1 = rw rootfs snapshot; strips instance identity, keeps enables
+  local r=$1
+  if [ "$DRYRUN" = 1 ]; then echo "DRY: sysprep $r"; return 0; fi
+  info "sysprep $r"
+  truncate -s0 "$r/etc/machine-id"
+  echo ct-template > "$r/etc/hostname"
+  printf '127.0.0.1 localhost\n' > "$r/etc/hosts"
+  rm -f "$r/etc/systemd/network/eth0.network" "$r/etc/profile.d/ct-alias.sh"
+  rm -rf "${r:?}/var/log"/* "$r"/var/cache/apt/archives/*.deb \
+         "$r"/var/lib/apt/lists/* "$r"/tmp/* "$r"/var/tmp/*
+  rm -f "$r/root/.bash_history" "$r/root/.lesshst" \
+        "$r/var/lib/systemd/random-seed" "$r"/etc/ssh/ssh_host_*
+  # dbus machine-id is systemd's fallback source when /etc/machine-id is
+  # empty - leaving it would clone the source CT's identity
+  rm -f "$r/var/lib/dbus/machine-id"
+  return 0
+}
+
+tpl_snapshot_from() {  # $1=ct $2=name : snapshot -> sysprep -> ro -> rotate in
+  local ct=$1 name=$2
+  local new="$CT_TEMPLATE_DIR/.$name.new" dst="$CT_TEMPLATE_DIR/$name"
+  run mkdir -p "$CT_TEMPLATE_DIR"
+  [ -e "$new" ] && run btrfs subvolume delete "$new" >/dev/null
+  info "snapshot $ct rootfs -> template staging"
+  if [ "$DRYRUN" = 1 ]; then
+    echo "DRY: btrfs subvolume snapshot $CT_LXC_DIR/$ct/rootfs $new"
+  elif btrfs subvolume show "$CT_LXC_DIR/$ct/rootfs" >/dev/null 2>&1; then
+    btrfs subvolume snapshot "$CT_LXC_DIR/$ct/rootfs" "$new" >/dev/null
+  else
+    # legacy CT: rootfs is a plain dir inside the ctN subvolume - CoW-copy it
+    info "(legacy rootfs dir - using reflink copy)"
+    btrfs subvolume create "$new" >/dev/null
+    cp -a --reflink=auto "$CT_LXC_DIR/$ct/rootfs/." "$new/"
+  fi
+  sysprep "$new"
+  run btrfs property set "$new" ro true
+  if [ -e "$dst" ]; then
+    if [ -e "$dst.prev" ]; then
+      info "dropping old $name.prev"
+      run btrfs subvolume delete "$dst.prev" >/dev/null
+    fi
+    info "rotating $name -> $name.prev"
+    run mv "$dst" "$dst.prev"
+  fi
+  run mv "$new" "$dst"
+  info "template '$name' ready: $dst (rollback: --template $name.prev)"
+}
+
+tpl_bake() {
+  need_root
+  local name="" role=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --config)  role="${2:?--config needs a name}"; shift 2 ;;
+      -h|--help) usage_template; return 0 ;;
+      -*) die "unknown argument: $1 (see: ct help template)" ;;
+      *)  name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: ct template bake <name> [--config <role>]"
+  tpl_name_ok "$name"
+  [ -z "$role" ] || [ -f "$CONFDIR/$role.conf" ] || die "named config not found: $CONFDIR/$role.conf"
+
+  # temp CT in the HIGHEST free slot (keeps low slots for real CTs)
+  local n="" i
+  for i in $(seq "$(ct_max)" -1 1); do
+    [ ! -e "$CT_LXC_DIR/ct$i" ] && { n=$i; break; }
+  done
+  [ -n "$n" ] || die "no free CT slot for bake"
+  local tmpct="ct$n"
+
+  if [ "$DRYRUN" = 1 ]; then
+    info "bake plan: fresh debootstrap $tmpct${role:+ (role $role)} -> stop -> sysprep -> template '$name' (existing rotates to .prev) -> destroy $tmpct"
+    return 0
+  fi
+  info "bake: building temp $tmpct (fresh debootstrap${role:+, role $role}, no DNS)"
+  local cargs=(--name "$tmpct" --no-dns)
+  [ -n "$role" ] && cargs+=(--config "$role")
+  BAKE_FRESH=1 cmd_create "${cargs[@]}"
+  info "bake: stopping $tmpct"
+  systemctl stop "ct@$n.service"
+  tpl_snapshot_from "$tmpct" "$name"
+  info "bake: destroying temp $tmpct"
+  cmd_destroy "$tmpct" --yes --purge
+}
+
+tpl_make() {
+  need_root
+  local name="" from=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)    from="${2:?--from needs ctN}"; shift 2 ;;
+      -h|--help) usage_template; return 0 ;;
+      -*) die "unknown argument: $1 (see: ct help template)" ;;
+      *)  name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] && [ -n "$from" ] || die "usage: ct template make <name> --from <ctN>"
+  tpl_name_ok "$name"
+  local ct; ct=$(norm_ct "$from")
+  ct_exists "$ct" || die "$ct does not exist"
+  ct_running "$ct" && die "$ct is running - stop it first (ct stop $ct)"
+  tpl_snapshot_from "$ct" "$name"
+}
+
+tpl_list() {
+  local d name created size
+  [ -d "$CT_TEMPLATE_DIR" ] || { echo "no templates ($CT_TEMPLATE_DIR missing)"; return 0; }
+  printf "%-20s %-22s %s\n" NAME CREATED SIZE
+  local found=0
+  for d in "$CT_TEMPLATE_DIR"/*; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    case "$name" in .*) continue ;; esac
+    found=1
+    created=$(btrfs subvolume show "$d" 2>/dev/null | awk '/Creation time:/{sub(/^[ \t]*Creation time:[ \t]*/,""); print; exit}')
+    size=$(du -sh "$d" 2>/dev/null | cut -f1)
+    printf "%-20s %-22s %s\n" "$name" "${created:-?}" "${size:-?}"
+  done
+  [ "$found" = 1 ] || echo "(none)"
+}
+
+tpl_rm() {
+  need_root
+  local name="" yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes) yes=1; shift ;;
+      -h|--help) usage_template; return 0 ;;
+      -*) die "unknown argument: $1 (see: ct help template)" ;;
+      *)  name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: ct template rm <name> --yes"
+  [ -e "$CT_TEMPLATE_DIR/$name" ] || die "template not found: $CT_TEMPLATE_DIR/$name"
+  [ "$yes" = 1 ] || die "refusing without --yes"
+  run btrfs subvolume delete "$CT_TEMPLATE_DIR/$name" >/dev/null
+  info "template '$name' removed"
 }
 
 # ---------------------------------------------------------------------------
@@ -1446,6 +1615,7 @@ EOF
 # /etc/ct/mqtt.conf - MQTT node profile (use: ct create --config mqtt)
 # Pure delta over defaults.conf: base packages/hooks come from defaults
 # (lists accumulate). Mainline broker from mosquitto.org, not Debian's.
+CT_TEMPLATE=mqtt-base          # baked via: ct template bake mqtt-base --config mqtt
 CT_REPOS=( "mosquitto-repo.sh" )
 CT_INSTALL="mosquitto mosquitto-clients"
 EOF
@@ -1579,6 +1749,7 @@ payload_completion() {
 # bash completion for ct (generated by 'ct completion')
 _ct_cts()   { ls -d /var/lib/lxc/ct[0-9]* 2>/dev/null | xargs -rn1 basename; }
 _ct_roles() { ls /etc/ct/*.conf 2>/dev/null | xargs -rn1 basename | sed 's/\.conf$//' | grep -v '^defaults$'; }
+_ct_templates() { ls /var/lib/lxc/.templates 2>/dev/null | grep -v '^\.'; }
 
 _ct() {
   local cur prev cmd
@@ -1605,7 +1776,7 @@ _ct() {
     create)
       case "$prev" in
         --config)   COMPREPLY=($(compgen -W "$(_ct_roles)" -- "$cur")); return ;;
-        --template) COMPREPLY=($(compgen -f -- "$cur")); return ;;
+        --template) COMPREPLY=($(compgen -W "$(_ct_templates)" -f -- "$cur")); return ;;
       esac
       COMPREPLY=($(compgen -W "--name --config --alias --template --no-dns $res_flags" -- "$cur")) ;;
     destroy) COMPREPLY=($(compgen -W "$(_ct_cts) --yes --force --purge --keep-dns" -- "$cur")) ;;
@@ -1616,6 +1787,14 @@ _ct() {
     set) COMPREPLY=($(compgen -W "$(_ct_cts) --alias --live $res_flags" -- "$cur")) ;;
     init) COMPREPLY=($(compgen -W "--check --force" -- "$cur")) ;;
     gcp-init) COMPREPLY=($(compgen -W "--check" -- "$cur")) ;;
+    template)
+      case "$prev" in
+        template) COMPREPLY=($(compgen -W "bake make list rm" -- "$cur")); return ;;
+        rm)       COMPREPLY=($(compgen -W "$(_ct_templates)" -- "$cur")); return ;;
+        --config) COMPREPLY=($(compgen -W "$(_ct_roles)" -- "$cur")); return ;;
+        --from)   COMPREPLY=($(compgen -W "$(_ct_cts)" -- "$cur")); return ;;
+      esac
+      COMPREPLY=($(compgen -W "--config --from --yes" -- "$cur")) ;;
     hooks) COMPREPLY=($(compgen -W "list pull" -- "$cur")) ;;
     help) COMPREPLY=($(compgen -W "create destroy attach exec list info start stop restart set init gcp-init doctor hooks completion" -- "$cur")) ;;
   esac
@@ -1642,6 +1821,11 @@ Containers:
   info     <ctN>
   start|stop|restart <ctN>... | --all
   set      <ctN> [resource flags] [--alias <name>] [--live]
+
+CT templates (baked read-only rootfs snapshots; creates take ~seconds):
+  template bake <name> [--config <role>]   fresh debootstrap -> sysprep -> template
+  template make <name> --from <ctN>        template from an existing (stopped) CT
+  template list | rm <name> --yes          existing name rotates to <name>.prev
 
 Host / GCP:
   init     [--check] [--force]      bootstrap this host (configs, unit, deps, sshd, nftables)
@@ -1764,6 +1948,27 @@ EOF
 
 usage_doctor() { echo "ct doctor - read-only health report (exit 0 ok / 1 warns / 2 fails)"; }
 
+usage_template() {
+  cat <<EOF
+ct template - manage CT templates (sysprepped read-only rootfs snapshots)
+
+  ct template bake <name> [--config <role>]
+      Full refresh cycle: fresh debootstrap into a temp CT (highest free slot,
+      no DNS; role's repos/install/hooks baked in) -> stop -> sysprep ->
+      snapshot to $CT_TEMPLATE_DIR/<name> -> destroy temp CT.
+      An existing <name> rotates to <name>.prev (one-deep rollback).
+  ct template make <name> --from <ctN>
+      Same sysprep+snapshot from a hand-built CT (must be stopped).
+  ct template list
+  ct template rm <name> --yes
+
+  Use: CT_TEMPLATE=<name> in a role conf, or ct create --template <name>.
+  Creates from a template skip debootstrap/fresh-build but still stamp
+  identity and run repos -> install -> hooks. Templates are CoW-independent
+  of their source CT and are never booted.
+EOF
+}
+
 usage_hooks() {
   cat <<'EOF'
 ct hooks - manage CT hook scripts (fetched from CT_HOOKS_REPO_URL)
@@ -1778,7 +1983,7 @@ cmd_help() {
     create) usage_create ;; destroy) usage_destroy ;; attach) usage_attach ;;
     exec) usage_exec ;; list) usage_list ;; info) usage_info ;;
     set) usage_set ;; init) usage_init ;; gcp-init) usage_gcp_init ;;
-    doctor) usage_doctor ;; hooks) usage_hooks ;;
+    doctor) usage_doctor ;; template) usage_template ;; hooks) usage_hooks ;;
     start|stop|restart) echo "ct ${1} <ctN> [ctN...] | --all" ;;
     completion) echo "ct completion - emit bash completion (install: ct completion > /etc/bash_completion.d/ct)" ;;
     *) usage ;;
@@ -1818,6 +2023,7 @@ main() {
     init)     cmd_init "$@" ;;
     gcp-init) cmd_gcp_init "$@" ;;
     doctor)   cmd_doctor "$@" ;;
+    template) cmd_template "$@" ;;
     hooks)    cmd_hooks "$@" ;;
     completion) cmd_completion "$@" ;;
     help)     cmd_help "$@" ;;
